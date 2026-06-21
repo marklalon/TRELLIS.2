@@ -16,6 +16,10 @@ case "${1:-demo}" in
         echo "Launching Gradio web UI on port 7860..."
         exec python app.py
         ;;
+    serve)
+        echo "Launching TRELLIS.2 inference server on port ${TRELLIS2_PORT:-8000}..."
+        exec python serve.py --host "${TRELLIS2_HOST:-0.0.0.0}" --port "${TRELLIS2_PORT:-8000}"
+        ;;
     texturing)
         echo "Running texturing demo..."
         exec python example_texturing.py

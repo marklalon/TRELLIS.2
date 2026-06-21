@@ -11,9 +11,14 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - OPENCV_IO_ENABLE_OPENEXR=1
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - ATTN_BACKEND=flash-attn
       - HF_HOME=/workspace/.cache/huggingface
+      # Service-mode settings (used by `serve`)
+      - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
+      - TRELLIS2_PORT=8000
+      # Set to 0 to keep the whole pipeline resident in VRAM (needs more memory)
+      - TRELLIS2_LOW_VRAM=0
+      - TRELLIS2_PIPELINE=1024_cascade
     volumes:
       # Mount the project source code (read-write for development)
       - .:/workspace/TRELLIS.2
@@ -23,10 +28,18 @@ services:
       - hf_cache:/workspace/.cache/huggingface
     working_dir: /workspace/TRELLIS.2
     ports:
-      # Gradio web UI port
-      - "7860:7860"
+      # Inference server (HTTP / WebSocket) — vLLM-style service mode
+      - "8086:8000"
     stdin_open: true
     tty: true
+    # Run as a persistent service: model stays resident, clients hit HTTP/WS.
+    command: serve
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     deploy:
       resources:
         reservations:
@@ -34,8 +47,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    # Override to run the Gradio app instead
-    # command: python app.py
+    # Override `command:` above with `demo`, `app`, `texturing`, or `bash` for other modes.
 
 volumes:
   hf_cache:
