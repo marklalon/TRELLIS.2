@@ -82,7 +82,7 @@ generation reports queue wait time and milestone progress from image
 preprocessing through GLB export. Follow them with:
 
 ```bash
-docker logs --timestamps --follow trellis2
+docker logs --follow trellis2
 ```
 
 For client-side live progress, use the WebSocket mode shown above. Plain HTTP

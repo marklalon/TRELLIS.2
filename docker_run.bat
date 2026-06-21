@@ -93,7 +93,7 @@ echo [ERROR] Container startup failed.
 exit /b 1
 
 :health_failed
-echo [ERROR] Container did not become healthy. Check logs with: docker logs --timestamps %CONTAINER_NAME%
+echo [ERROR] Container did not become healthy. Check logs with: docker logs %CONTAINER_NAME%
 exit /b 1
 
 rem =============================================

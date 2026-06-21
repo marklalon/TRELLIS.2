@@ -102,14 +102,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         path: str,
         config_file: str = "pipeline.json",
         progress_callback: Optional[Callable[[str], None]] = None,
+        device=None,
     ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
+            device: Optional device to load checkpoint weights directly onto
+                    (e.g. ``"cuda"``). Defaults to CPU.
         """
-        pipeline = super().from_pretrained(path, config_file, progress_callback)
+        pipeline = super().from_pretrained(path, config_file, progress_callback, device=device)
         args = pipeline._pretrained_args
         is_local_path = getattr(pipeline, '_is_local_path', False)
 

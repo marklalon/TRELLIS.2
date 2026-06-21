@@ -130,6 +130,10 @@ def _load_pipeline():
     )
 
     logger.info("Loading pipeline from: %s", MODEL_PATH)
+    # When the whole pipeline stays resident in VRAM, load checkpoint weights
+    # straight onto the GPU to avoid a separate CPU->GPU copy. In low-VRAM mode
+    # the models live on CPU and are offloaded per step, so load to CPU.
+    load_device = None if LOW_VRAM else "cuda"
     pipeline = _run_startup_stage(
         "loading model pipeline",
         lambda: pipeline_class.from_pretrained(
@@ -137,10 +141,14 @@ def _load_pipeline():
             progress_callback=lambda message: logger.info(
                 "Startup progress: %s", message
             ),
+            device=load_device,
         ),
     )
     pipeline.low_vram = LOW_VRAM
     pipeline.default_pipeline_type = DEFAULT_PIPELINE
+    # Moves the remaining submodules (image encoder, background remover) to CUDA;
+    # checkpoints loaded with device="cuda" above are already resident so this is
+    # near-free for them.
     _run_startup_stage("moving pipeline to CUDA", pipeline.cuda)
     state.pipeline = pipeline
     state.ready = True

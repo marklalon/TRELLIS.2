@@ -4,7 +4,7 @@ import torch.nn as nn
 from .. import models
 
 
-def _load_model_from_local(base_path: str, model_ref: str) -> nn.Module:
+def _load_model_from_local(base_path: str, model_ref: str, device=None) -> nn.Module:
     """
     Resolve a model reference from pipeline.json against a local base path.
 
@@ -20,7 +20,7 @@ def _load_model_from_local(base_path: str, model_ref: str) -> nn.Module:
     # Candidate 1: direct join
     candidate = f"{base_path}/{model_ref}"
     if os.path.exists(f"{candidate}.json") and os.path.exists(f"{candidate}.safetensors"):
-        return models.from_pretrained(candidate)
+        return models.from_pretrained(candidate, device=device)
 
     # Candidate 2: strip HF org/repo prefix (e.g. microsoft/TRELLIS-image-large)
     parts = model_ref.split('/')
@@ -28,13 +28,13 @@ def _load_model_from_local(base_path: str, model_ref: str) -> nn.Module:
         stripped = '/'.join(parts[2:])
         candidate = f"{base_path}/{stripped}"
         if os.path.exists(f"{candidate}.json") and os.path.exists(f"{candidate}.safetensors"):
-            return models.from_pretrained(candidate)
+            return models.from_pretrained(candidate, device=device)
 
     # Candidate 3: check basename under base_path/ckpts/
     basename = parts[-1]
     candidate = f"{base_path}/ckpts/{basename}"
     if os.path.exists(f"{candidate}.json") and os.path.exists(f"{candidate}.safetensors"):
-        return models.from_pretrained(candidate)
+        return models.from_pretrained(candidate, device=device)
 
     # Candidate 4: sibling HF repo under the same volume root
     # e.g. microsoft/TRELLIS-image-large/ckpts/ss_dec_...  ->
@@ -50,7 +50,7 @@ def _load_model_from_local(base_path: str, model_ref: str) -> nn.Module:
             volume_root = '/'.join(base_parts[:-1])
             candidate = f"{volume_root}/{repo}/{sub}"
             if os.path.exists(f"{candidate}.json") and os.path.exists(f"{candidate}.safetensors"):
-                return models.from_pretrained(candidate)
+                return models.from_pretrained(candidate, device=device)
 
     raise FileNotFoundError(
         f"Local checkpoint not found for model reference '{model_ref}'.\n"
@@ -83,15 +83,22 @@ class Pipeline:
         path: str,
         config_file: str = "pipeline.json",
         progress_callback: Optional[Callable[[str], None]] = None,
+        device=None,
     ) -> "Pipeline":
         """
         Load a pretrained model.
 
         If path is a local filesystem path (absolute or contains backslashes), models are
         loaded exclusively from disk. Otherwise, they are downloaded from HuggingFace Hub.
+
+        Args:
+            device: Optional device to load checkpoint weights directly onto
+                    (e.g. ``"cuda"``). Defaults to CPU.
         """
         import os
         import json
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
 
         is_local_path = os.path.isabs(path) or '\\' in path
 
@@ -118,15 +125,37 @@ class Pipeline:
             (k, v) for k, v in args['models'].items()
             if not hasattr(cls, 'model_names_to_load') or k in cls.model_names_to_load
         ]
-        for index, (k, v) in enumerate(models_to_load, 1):
+        total = len(models_to_load)
+        # Checkpoint loading is dominated by disk I/O (safetensors releases the
+        # GIL while reading) and the H2D copy, so loading several at once
+        # overlaps those waits. Set TRELLIS2_LOAD_WORKERS=1 to load serially.
+        max_workers = max(1, int(os.environ.get("TRELLIS2_LOAD_WORKERS", "4")))
+        max_workers = min(max_workers, total) or 1
+
+        progress_lock = threading.Lock()
+        counter = {"n": 0}
+
+        def _load_one(item):
+            k, v = item
+            with progress_lock:
+                counter["n"] += 1
+                index = counter["n"]
             if progress_callback is not None:
-                progress_callback(
-                    f"loading checkpoint {index}/{len(models_to_load)}: {k}"
-                )
+                progress_callback(f"loading checkpoint {index}/{total}: {k}")
             if is_local_path:
-                _models[k] = _load_model_from_local(path, v)
+                model = _load_model_from_local(path, v, device=device)
             else:
-                _models[k] = models.from_pretrained(f"{path}/{v}")
+                model = models.from_pretrained(f"{path}/{v}", device=device)
+            return k, model
+
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for k, model in executor.map(_load_one, models_to_load):
+                    _models[k] = model
+        else:
+            for item in models_to_load:
+                k, model = _load_one(item)
+                _models[k] = model
 
         new_pipeline = cls(_models)
         new_pipeline._pretrained_args = args
