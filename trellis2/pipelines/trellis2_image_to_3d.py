@@ -1,4 +1,5 @@
 from typing import *
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,6 +9,23 @@ from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+
+
+def _resolve_model_names_to_local(args: dict) -> None:
+    """
+    Replace HF model names (e.g. ``facebook/dinov3-vitl16-pretrain-lvd1689m``)
+    with local filesystem paths under ``/models/`` when loading from disk.
+    """
+    for section, key in [
+        ('image_cond_model', 'model_name'),
+        ('rembg_model', 'model_name'),
+    ]:
+        sec = args.get(section, {})
+        name = sec.get('args', {}).get(key, '')
+        if name and '/' in name and not os.path.isabs(name):
+            local_path = f"/models/{name}"
+            if os.path.exists(local_path):
+                sec['args'][key] = local_path
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -88,6 +106,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         pipeline = super().from_pretrained(path, config_file)
         args = pipeline._pretrained_args
+        is_local_path = getattr(pipeline, '_is_local_path', False)
+
+        # Resolve HF model names to local paths when loading from disk
+        if is_local_path:
+            _resolve_model_names_to_local(args)
 
         pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
         pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']

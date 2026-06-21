@@ -47,16 +47,27 @@ def from_pretrained(path: str, **kwargs):
     import os
     import json
     from safetensors.torch import load_file
-    is_local = os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors")
 
-    if is_local:
-        config_file = f"{path}.json"
-        model_file = f"{path}.safetensors"
+    is_local_path = path.startswith('/') or '\\' in path
+
+    if is_local_path:
+        cfg = f"{path}.json"
+        wts = f"{path}.safetensors"
+        if not (os.path.exists(cfg) and os.path.exists(wts)):
+            raise FileNotFoundError(
+                f"Local model checkpoint not found.\n"
+                f"  Expected: {cfg}\n"
+                f"  Expected: {wts}\n"
+                f"Ensure the models Docker volume is mounted."
+            )
+        config_file = cfg
+        model_file = wts
     else:
         from huggingface_hub import hf_hub_download
-        path_parts = path.split('/')
+        clean_path = path.replace('\\', '/').strip('/')
+        path_parts = clean_path.split('/')
         repo_id = f'{path_parts[0]}/{path_parts[1]}'
-        model_name = '/'.join(path_parts[2:])
+        model_name = '/'.join(path_parts[2:]) if len(path_parts) > 2 else path_parts[-1]
         config_file = hf_hub_download(repo_id, f"{model_name}.json")
         model_file = hf_hub_download(repo_id, f"{model_name}.safetensors")
 

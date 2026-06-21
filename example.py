@@ -45,4 +45,4 @@ glb = o_voxel.postprocess.to_glb(
     remesh_project      =   0,
     verbose             =   True
 )
-glb.export("sample.glb", extension_webp=True)
+glb.export("sample.glb", extension_webp=False)

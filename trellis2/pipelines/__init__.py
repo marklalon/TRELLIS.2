@@ -32,10 +32,17 @@ def from_pretrained(path: str):
     """
     import os
     import json
-    is_local = os.path.exists(f"{path}/pipeline.json")
 
-    if is_local:
-        config_file = f"{path}/pipeline.json"
+    is_local_path = os.path.isabs(path) or '\\' in path
+
+    if is_local_path:
+        local_cfg = f"{path}/pipeline.json"
+        if not os.path.exists(local_cfg):
+            raise FileNotFoundError(
+                f"Local pipeline config not found: {local_cfg}\n"
+                f"Ensure the models Docker volume is mounted and contains pipeline.json."
+            )
+        config_file = local_cfg
     else:
         from huggingface_hub import hf_hub_download
         config_file = hf_hub_download(path, "pipeline.json")

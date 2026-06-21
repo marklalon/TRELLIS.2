@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  trellis2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trellis2:latest
+    container_name: trellis2
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OPENCV_IO_ENABLE_OPENEXR=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - ATTN_BACKEND=flash-attn
+      - HF_HOME=/workspace/.cache/huggingface
+    volumes:
+      # Mount the project source code (read-write for development)
+      - .:/workspace/TRELLIS.2
+      # Mount the pretrained model weights (Docker named volume)
+      - models:/models:ro
+      # Cache HuggingFace downloads (optional but recommended)
+      - hf_cache:/workspace/.cache/huggingface
+    working_dir: /workspace/TRELLIS.2
+    ports:
+      # Gradio web UI port
+      - "7860:7860"
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Override to run the Gradio app instead
+    # command: python app.py
+
+volumes:
+  hf_cache:
+  models:
+    external: true

@@ -83,7 +83,9 @@ class DinoV3FeatureExtractor:
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for i, layer_module in enumerate(self.model.layer):
+        # HuggingFace DINOv3ViTModel stores encoder layers under model.model.layer
+        encoder_layers = self.model.model.layer
+        for i, layer_module in enumerate(encoder_layers):
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,

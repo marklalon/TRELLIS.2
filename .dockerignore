@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+.gitmodules
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+*.egg
+
+# Virtual environment
+.venv
+venv
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Temporary / output
+tmp
+output
+*.mp4
+*.glb
+*.gltf
+*.ply
+
+# Model weights (mounted as volume)
+models
+
+# OS files
+.DS_Store
+Thumbs.db

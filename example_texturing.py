@@ -14,4 +14,4 @@ image = Image.open("assets/example_texturing/image.webp")
 output = pipeline.run(mesh, image)
 
 # 3. Render Mesh
-output.export("textured.glb", extension_webp=True)
+output.export("textured.glb", extension_webp=False)

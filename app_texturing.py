@@ -82,7 +82,7 @@ def shapeimage_to_tex(
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     os.makedirs(user_dir, exist_ok=True)
     glb_path = os.path.join(user_dir, f'sample_{timestamp}.glb')
-    output.export(glb_path, extension_webp=True)
+    output.export(glb_path, extension_webp=False)
     torch.cuda.empty_cache()
     return glb_path, glb_path
 
