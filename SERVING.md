@@ -34,7 +34,6 @@ python serve.py --host 0.0.0.0 --port 8000
 | Variable | Default | Meaning |
 |---|---|---|
 | `TRELLIS2_MODEL_PATH` | `/models/microsoft/TRELLIS.2-4B` | Weights path / HF repo |
-| `TRELLIS2_LOW_VRAM` | `1` | `1` = offload submodules to CPU between steps; `0` = keep whole pipeline resident in VRAM (faster, needs more memory) |
 | `TRELLIS2_PIPELINE` | `1024_cascade` | Default pipeline type: `512` / `1024` / `1024_cascade` / `1536_cascade` |
 | `TRELLIS2_PORT` | `8000` | Listen port |
 
@@ -54,11 +53,9 @@ Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
 ## Client
 
 ```bash
-# HTTP
-python trellis2_client.py --image assets/example_image/T.png --output out.glb
-
 # WebSocket (streams progress)
-python trellis2_client.py --image in.png --output out.glb --ws \
+python trellis2_client.py --image assets/example_image/T.png --output out.glb
+python trellis2_client.py --image in.png --output out.glb \
     --server http://localhost:8086 --pipeline-type 1024_cascade
 ```
 
@@ -85,6 +82,5 @@ preprocessing through GLB export. Follow them with:
 docker logs --follow trellis2
 ```
 
-For client-side live progress, use the WebSocket mode shown above. Plain HTTP
-keeps the connection open until the GLB is complete, while its progress remains
-visible in the container logs.
+The client uses WebSocket and displays generation progress in real time. The
+HTTP endpoint remains available for integrations such as `curl`.

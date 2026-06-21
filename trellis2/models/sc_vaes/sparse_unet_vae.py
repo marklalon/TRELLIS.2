@@ -418,8 +418,7 @@ class SparseUnetVaeDecoder(nn.Module):
         self.use_fp16 = use_fp16
         self.pred_subdiv = pred_subdiv
         self.dtype = torch.float16 if use_fp16 else torch.float32
-        self.low_vram = False
-        
+
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
         

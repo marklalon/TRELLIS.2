@@ -19,8 +19,6 @@ services:
       # Service-mode settings (used by `serve`)
       - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
       - TRELLIS2_PORT=8000
-      # Set to 0 to keep the whole pipeline resident in VRAM (needs more memory)
-      - TRELLIS2_LOW_VRAM=0
       - TRELLIS2_PIPELINE=1024_cascade
     volumes:
       # Mount the project source code (read-write for development)

@@ -1,113 +1,164 @@
-"""
-TRELLIS.2 service client — send an image, save a textured GLB.
+"""TRELLIS.2 WebSocket client — stream progress and save a textured GLB.
 
-HTTP (default):
+Example:
     python trellis2_client.py --image assets/example_image/T.png --output out.glb
-    python trellis2_client.py --image in.png --server http://HOST:8000 --pipeline-type 1024_cascade
+    python trellis2_client.py --image in.png --server http://HOST:8000 \
+        --pipeline-type 1024_cascade
 
-WebSocket (streams progress):
-    python trellis2_client.py --image in.png --output out.glb --ws
-
-Only needs `requests` for HTTP, and `websockets` for the --ws mode.
+Requires the ``websockets`` package.
 """
 import argparse
+import asyncio
 import base64
+import json
+import os
 import sys
 import time
 
+def _websocket_url(server: str) -> str:
+    base = server.rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    elif not base.startswith(("ws://", "wss://")):
+        base = "ws://" + base
+    return base + "/ws/generate"
 
-def run_http(args):
-    import requests
-    url = args.server.rstrip("/") + "/generate"
-    data = {
+
+class ProgressDisplay:
+    """Render progress in place on a terminal, or as lines when redirected."""
+
+    def __init__(self, width: int = 30):
+        self.width = width
+        self.last_length = 0
+        self.active = False
+
+    def update(self, percent: int, step: str, elapsed: float | None = None) -> None:
+        percent = max(0, min(100, int(percent)))
+        filled = round(self.width * percent / 100)
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed_text = f"  {elapsed:.1f}s" if elapsed is not None else ""
+        line = f"[client] [{bar}] {percent:3d}%  {step}{elapsed_text}"
+
+        if sys.stdout.isatty():
+            sys.stdout.write("\r" + line.ljust(self.last_length))
+            sys.stdout.flush()
+            self.last_length = max(self.last_length, len(line))
+            self.active = True
+        else:
+            print(line)
+
+    def finish(self) -> None:
+        if self.active:
+            print()
+            self.active = False
+
+
+async def _run(args) -> None:
+    try:
+        import websockets
+    except ImportError as exc:
+        raise RuntimeError(
+            "missing dependency 'websockets'; install it with: pip install websockets"
+        ) from exc
+
+    ws_url = _websocket_url(args.server)
+    with open(args.image, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+    payload = {
+        "image_base64": image_b64,
         "seed": args.seed,
         "texture_size": args.texture_size,
         "decimation_target": args.decimation_target,
-        "preprocess_image": str(args.preprocess).lower(),
+        "preprocess_image": args.preprocess,
     }
     if args.pipeline_type:
-        data["pipeline_type"] = args.pipeline_type
+        payload["pipeline_type"] = args.pipeline_type
+
+    progress = ProgressDisplay()
     started_at = time.monotonic()
+    print(f"[client] connecting {ws_url}")
     try:
-        with open(args.image, "rb") as f:
-            files = {"image": (args.image, f, "application/octet-stream")}
-            print(f"[client] POST {url}")
-            resp = requests.post(url, data=data, files=files, timeout=args.timeout)
-        if resp.status_code != 200:
-            print(f"[client] error {resp.status_code}: {resp.text}", file=sys.stderr)
-            sys.exit(1)
-        with open(args.output, "wb") as f:
-            f.write(resp.content)
-        print(f"[client] saved {len(resp.content)} bytes -> {args.output}")
+        async with websockets.connect(
+            ws_url,
+            max_size=64 * 1024 * 1024,
+            open_timeout=args.timeout,
+        ) as ws:
+            await ws.send(json.dumps(payload))
+
+            async for raw_message in ws:
+                message = json.loads(raw_message)
+                stage = message.get("stage", "unknown")
+
+                if stage == "queued":
+                    if message.get("queued"):
+                        print("[client] queued; waiting for the GPU")
+                    else:
+                        print("[client] GPU is available; starting generation")
+                elif stage == "processing":
+                    progress.update(
+                        message.get("progress", 0),
+                        message.get("step", "processing"),
+                        message.get("elapsed_sec"),
+                    )
+                elif stage == "done":
+                    progress.update(100, "complete", message.get("elapsed_sec"))
+                    progress.finish()
+                    glb = base64.b64decode(message["glb_base64"])
+                    output_dir = os.path.dirname(os.path.abspath(args.output))
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(args.output, "wb") as f:
+                        f.write(glb)
+                    print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                    return
+                elif stage == "error":
+                    raise RuntimeError(message.get("message", "unknown server error"))
+                else:
+                    print(f"[client] server stage: {stage}")
+
+            raise RuntimeError("WebSocket closed before the result was received")
     finally:
+        progress.finish()
         print(f"[client] request elapsed: {time.monotonic() - started_at:.2f}s")
 
 
-def run_ws(args):
-    import asyncio
-    import json
-    import websockets
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="TRELLIS.2 WebSocket client with live progress"
+    )
+    parser.add_argument("--image", required=True, help="Input image path")
+    parser.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
+    parser.add_argument("--server", default="http://localhost:8086", help="Server base URL")
+    # Kept so existing commands using --ws continue to work; WebSocket is now
+    # always enabled.
+    parser.add_argument("--ws", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--pipeline-type",
+        default=None,
+        help="512 / 1024 / 1024_cascade / 1536_cascade (default: server's)",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--texture-size", type=int, default=2048)
+    parser.add_argument("--decimation-target", type=int, default=100000)
+    parser.add_argument(
+        "--preprocess",
+        type=lambda value: value.lower() not in ("0", "false", "no"),
+        default=True,
+        help="Preprocess/remove background (default: true)",
+    )
+    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
+    args = parser.parse_args()
 
-    async def _go():
-        ws_url = args.server.rstrip("/").replace("http://", "ws://").replace("https://", "wss://")
-        ws_url += "/ws/generate"
-        with open(args.image, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("ascii")
-        payload = {
-            "image_base64": image_b64,
-            "seed": args.seed,
-            "texture_size": args.texture_size,
-            "decimation_target": args.decimation_target,
-            "preprocess_image": args.preprocess,
-        }
-        if args.pipeline_type:
-            payload["pipeline_type"] = args.pipeline_type
-        print(f"[client] connecting {ws_url}")
-        async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
-            started_at = time.monotonic()
-            try:
-                await ws.send(json.dumps(payload))
-                while True:
-                    msg = json.loads(await ws.recv())
-                    stage = msg.get("stage")
-                    if stage == "done":
-                        glb = base64.b64decode(msg["glb_base64"])
-                        with open(args.output, "wb") as f:
-                            f.write(glb)
-                        print(f"[client] done in {msg.get('elapsed_sec')}s, "
-                              f"saved {len(glb)} bytes -> {args.output}")
-                        break
-                    elif stage == "error":
-                        print(f"[client] server error: {msg.get('message')}", file=sys.stderr)
-                        sys.exit(1)
-                    else:
-                        print(f"[client] {stage} {({k: v for k, v in msg.items() if k != 'stage'})}")
-            finally:
-                print(f"[client] request elapsed: {time.monotonic() - started_at:.2f}s")
-
-    asyncio.run(_go())
-
-
-def main():
-    p = argparse.ArgumentParser(description="TRELLIS.2 service client")
-    p.add_argument("--image", required=True, help="Input image path")
-    p.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
-    p.add_argument("--server", default="http://localhost:8086", help="Server base URL")
-    p.add_argument("--ws", action="store_true", help="Use WebSocket (streams progress)")
-    p.add_argument("--pipeline-type", default=None,
-                   help="512 / 1024 / 1024_cascade / 1536_cascade (default: server's)")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--texture-size", type=int, default=2048)
-    p.add_argument("--decimation-target", type=int, default=100000)
-    p.add_argument("--preprocess", type=lambda s: s.lower() not in ("0", "false", "no"),
-                   default=True, help="Preprocess/remove background (default: true)")
-    p.add_argument("--timeout", type=int, default=1800, help="HTTP timeout seconds")
-    args = p.parse_args()
-
-    if args.ws:
-        run_ws(args)
-    else:
-        run_http(args)
+    try:
+        asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        print("\n[client] cancelled", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"[client] error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

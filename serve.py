@@ -11,8 +11,6 @@ Run:
 
 Environment variables:
     TRELLIS2_MODEL_PATH   Path/HF repo of the weights (default /models/microsoft/TRELLIS.2-4B)
-    TRELLIS2_LOW_VRAM     "1" (default) offloads submodules to CPU between steps;
-                          "0" keeps the whole pipeline resident in VRAM (needs more memory).
     TRELLIS2_PIPELINE     Default pipeline type: 512 / 1024 / 1024_cascade / 1536_cascade
 """
 import os
@@ -54,7 +52,6 @@ logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
 
 
 MODEL_PATH = os.environ.get("TRELLIS2_MODEL_PATH", "/models/microsoft/TRELLIS.2-4B")
-LOW_VRAM = os.environ.get("TRELLIS2_LOW_VRAM", "1") not in ("0", "false", "False")
 DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "1024_cascade")
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
@@ -130,10 +127,8 @@ def _load_pipeline():
     )
 
     logger.info("Loading pipeline from: %s", MODEL_PATH)
-    # When the whole pipeline stays resident in VRAM, load checkpoint weights
-    # straight onto the GPU to avoid a separate CPU->GPU copy. In low-VRAM mode
-    # the models live on CPU and are offloaded per step, so load to CPU.
-    load_device = None if LOW_VRAM else "cuda"
+    # The whole pipeline stays resident in VRAM, so load checkpoint weights
+    # straight onto the GPU to avoid a separate CPU->GPU copy.
     pipeline = _run_startup_stage(
         "loading model pipeline",
         lambda: pipeline_class.from_pretrained(
@@ -141,10 +136,9 @@ def _load_pipeline():
             progress_callback=lambda message: logger.info(
                 "Startup progress: %s", message
             ),
-            device=load_device,
+            device="cuda",
         ),
     )
-    pipeline.low_vram = LOW_VRAM
     pipeline.default_pipeline_type = DEFAULT_PIPELINE
     # Moves the remaining submodules (image encoder, background remover) to CUDA;
     # checkpoints loaded with device="cuda" above are already resident so this is
@@ -153,8 +147,8 @@ def _load_pipeline():
     state.pipeline = pipeline
     state.ready = True
     state.loaded_at = time.time()
-    mode = "low-VRAM (CPU offload)" if LOW_VRAM else "fully resident in VRAM"
-    logger.info("Pipeline ready (%s); default type=%s", mode, DEFAULT_PIPELINE)
+    logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
+                DEFAULT_PIPELINE)
 
 
 def _run_generation(image: Image.Image, params: GenParams, request_id: str,
@@ -268,7 +262,6 @@ async def info():
         "model_path": MODEL_PATH,
         "ready": state.ready,
         "busy": state.busy,
-        "low_vram": LOW_VRAM,
         "default_pipeline_type": DEFAULT_PIPELINE,
         "loaded_at": state.loaded_at,
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
