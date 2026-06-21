@@ -180,9 +180,6 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
 
     report(78, "building GLB textures and materials")
 
-    def postprocess_progress(percent: int, stage: str) -> None:
-        report(78 + round(percent * 0.16), stage)
-
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
@@ -197,7 +194,6 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         remesh_band=1,
         remesh_project=0,
         verbose=False,
-        progress_callback=postprocess_progress,
     )
 
     # Export to a temp file then read bytes (to_glb returns a trimesh object).
