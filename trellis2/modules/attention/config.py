@@ -17,7 +17,7 @@ def __from_env():
     if env_attn_debug is not None:
         DEBUG = env_attn_debug == '1'
 
-    print(f"[ATTENTION] Using backend: {BACKEND}")
+    print(f"[ATTENTION] Using backend: {BACKEND}", flush=True)
         
 
 __from_env()

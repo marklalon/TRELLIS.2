@@ -97,14 +97,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self._device = 'cpu'
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2ImageTo3DPipeline":
+    def from_pretrained(
+        cls,
+        path: str,
+        config_file: str = "pipeline.json",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
         """
-        pipeline = super().from_pretrained(path, config_file)
+        pipeline = super().from_pretrained(path, config_file, progress_callback)
         args = pipeline._pretrained_args
         is_local_path = getattr(pipeline, '_is_local_path', False)
 
@@ -112,6 +117,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if is_local_path:
             _resolve_model_names_to_local(args)
 
+        if progress_callback is not None:
+            progress_callback("initializing samplers")
         pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
         pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
 
@@ -124,7 +131,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline.shape_slat_normalization = args['shape_slat_normalization']
         pipeline.tex_slat_normalization = args['tex_slat_normalization']
 
+        if progress_callback is not None:
+            progress_callback("loading image encoder")
         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
+        if progress_callback is not None:
+            progress_callback("loading background-removal model")
         pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
         
         pipeline.low_vram = args.get('low_vram', True)
@@ -521,6 +532,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -536,7 +548,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            progress_callback (callable): Optional ``(percent, stage)`` callback.
         """
+        def report(percent: int, stage: str) -> None:
+            if progress_callback is not None:
+                progress_callback(percent, stage)
+
+        report(0, "starting pipeline")
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
@@ -557,20 +575,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
         if preprocess_image:
+            report(5, "preprocessing image")
             image = self.preprocess_image(image)
+        report(10, "encoding image conditions")
         torch.manual_seed(seed)
         cond_512 = self.get_cond([image], 512)
         cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+        report(20, "sampling sparse structure")
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
             num_samples, sparse_structure_sampler_params
         )
+        report(40, "sampling shape")
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
                 coords, shape_slat_sampler_params
             )
+            report(65, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_512, self.models['tex_slat_flow_model_512'],
                 shape_slat, tex_slat_sampler_params
@@ -581,6 +604,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_1024, self.models['shape_slat_flow_model_1024'],
                 coords, shape_slat_sampler_params
             )
+            report(65, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
@@ -594,6 +618,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 coords, shape_slat_sampler_params,
                 max_num_tokens
             )
+            report(65, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
@@ -606,12 +631,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 coords, shape_slat_sampler_params,
                 max_num_tokens
             )
+            report(65, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
         torch.cuda.empty_cache()
+        report(85, "decoding mesh and texture")
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        report(100, "pipeline complete")
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
         else:

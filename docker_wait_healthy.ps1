@@ -31,14 +31,14 @@ try {
         exit 0
     }
     if ($state.Health.Status -eq 'unhealthy') {
-        & docker logs --tail 100 $ContainerName
+        & docker logs --timestamps --tail 100 $ContainerName
         throw "Container '$ContainerName' is unhealthy."
     }
 
     Write-Host "Streaming container logs until the health check passes..."
     $logProcess = Start-Process `
         -FilePath 'docker' `
-        -ArgumentList @('logs', '--follow', '--tail', '100', $ContainerName) `
+        -ArgumentList @('logs', '--timestamps', '--follow', '--tail', '100', $ContainerName) `
         -NoNewWindow `
         -PassThru
 

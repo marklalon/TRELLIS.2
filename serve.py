@@ -22,30 +22,76 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import argparse
 import asyncio
 import base64
+import importlib
 import io
+import logging
 import tempfile
+import threading
 import time
-import traceback
+import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+logger = logging.getLogger("trellis2.serve")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+logger.info("Startup progress: importing runtime dependencies")
+_runtime_import_started = time.monotonic()
 import torch
 from PIL import Image
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
-import o_voxel
+logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
+            time.monotonic() - _runtime_import_started)
 
 
 MODEL_PATH = os.environ.get("TRELLIS2_MODEL_PATH", "/models/microsoft/TRELLIS.2-4B")
 LOW_VRAM = os.environ.get("TRELLIS2_LOW_VRAM", "1") not in ("0", "false", "False")
 DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "1024_cascade")
+STARTUP_HEARTBEAT_SEC = max(
+    1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
+)
+o_voxel = None
+T = TypeVar("T")
+
+
+def _run_startup_stage(label: str, operation: Callable[[], T]) -> T:
+    """Run a startup operation with start/end logs and an elapsed heartbeat."""
+    started_at = time.monotonic()
+    finished = threading.Event()
+    logger.info("Startup stage started: %s", label)
+
+    def heartbeat() -> None:
+        while not finished.wait(STARTUP_HEARTBEAT_SEC):
+            logger.info("Startup stage in progress: %s elapsed=%.2fs",
+                        label, time.monotonic() - started_at)
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        result = operation()
+    except Exception:
+        logger.exception("Startup stage failed: %s elapsed=%.2fs",
+                         label, time.monotonic() - started_at)
+        raise
+    finally:
+        finished.set()
+        heartbeat_thread.join()
+    logger.info("Startup stage completed: %s elapsed=%.2fs",
+                label, time.monotonic() - started_at)
+    return result
 
 
 class _State:
-    pipeline: Optional[Trellis2ImageTo3DPipeline] = None
+    pipeline: Optional[object] = None
     # Only one generation may touch the GPU at a time; this lock turns the
     # server into a single-worker queue while still accepting many connections.
     gpu_lock: asyncio.Lock = asyncio.Lock()
@@ -71,29 +117,71 @@ class GenParams(BaseModel):
 
 
 def _load_pipeline():
-    print(f"[trellis2-serve] Loading pipeline from: {MODEL_PATH}")
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(MODEL_PATH)
+    global o_voxel
+
+    pipeline_module = _run_startup_stage(
+        "importing TRELLIS modules",
+        lambda: importlib.import_module("trellis2.pipelines"),
+    )
+    pipeline_class = pipeline_module.Trellis2ImageTo3DPipeline
+    o_voxel = _run_startup_stage(
+        "importing mesh post-processing modules",
+        lambda: importlib.import_module("o_voxel"),
+    )
+
+    logger.info("Loading pipeline from: %s", MODEL_PATH)
+    pipeline = _run_startup_stage(
+        "loading model pipeline",
+        lambda: pipeline_class.from_pretrained(
+            MODEL_PATH,
+            progress_callback=lambda message: logger.info(
+                "Startup progress: %s", message
+            ),
+        ),
+    )
     pipeline.low_vram = LOW_VRAM
     pipeline.default_pipeline_type = DEFAULT_PIPELINE
-    pipeline.cuda()
+    _run_startup_stage("moving pipeline to CUDA", pipeline.cuda)
     state.pipeline = pipeline
     state.ready = True
     state.loaded_at = time.time()
     mode = "low-VRAM (CPU offload)" if LOW_VRAM else "fully resident in VRAM"
-    print(f"[trellis2-serve] Pipeline ready ({mode}); default type={DEFAULT_PIPELINE}")
+    logger.info("Pipeline ready (%s); default type=%s", mode, DEFAULT_PIPELINE)
 
 
-def _run_generation(image: Image.Image, params: GenParams) -> bytes:
+def _run_generation(image: Image.Image, params: GenParams, request_id: str,
+                    progress_callback=None) -> bytes:
     """Blocking image -> GLB. Must be called inside the GPU lock."""
     pipeline = state.pipeline
+    started_at = time.monotonic()
+
+    def report(percent: int, stage: str) -> None:
+        elapsed = round(time.monotonic() - started_at, 2)
+        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs",
+                    request_id, percent, stage, elapsed)
+        if progress_callback is not None:
+            progress_callback(percent, stage, elapsed)
+
+    def pipeline_progress(percent: int, stage: str) -> None:
+        # The model pipeline is about 70% of the complete request; the rest is
+        # mesh cleanup, GLB construction and file export.
+        report(5 + round(percent * 0.65), stage)
+
     mesh = pipeline.run(
         image,
         seed=params.seed,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
         preprocess_image=params.preprocess_image,
+        progress_callback=pipeline_progress,
     )[0]
+    report(72, "simplifying mesh")
     mesh.simplify(params.simplify)
+
+    report(78, "building GLB textures and materials")
+
+    def postprocess_progress(percent: int, stage: str) -> None:
+        report(78 + round(percent * 0.16), stage)
 
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
@@ -108,13 +196,15 @@ def _run_generation(image: Image.Image, params: GenParams) -> bytes:
         remesh=True,
         remesh_band=1,
         remesh_project=0,
-        verbose=True,
+        verbose=False,
+        progress_callback=postprocess_progress,
     )
 
     # Export to a temp file then read bytes (to_glb returns a trimesh object).
     with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
         tmp_path = tmp.name
     try:
+        report(95, "exporting GLB")
         glb.export(tmp_path, extension_webp=False)
         with open(tmp_path, "rb") as f:
             data = f.read()
@@ -124,14 +214,20 @@ def _run_generation(image: Image.Image, params: GenParams) -> bytes:
         except OSError:
             pass
     torch.cuda.empty_cache()
+    report(100, f"complete ({len(data)} bytes)")
     return data
 
 
-async def _generate(image: Image.Image, params: GenParams) -> bytes:
+async def _generate(image: Image.Image, params: GenParams, request_id: str) -> bytes:
+    queued = state.gpu_lock.locked()
+    logger.info("[%s] queued=%s", request_id, queued)
+    wait_started = time.monotonic()
     async with state.gpu_lock:
         state.busy = True
+        logger.info("[%s] GPU acquired after %.2fs", request_id,
+                    time.monotonic() - wait_started)
         try:
-            return await asyncio.to_thread(_run_generation, image, params)
+            return await asyncio.to_thread(_run_generation, image, params, request_id)
         finally:
             state.busy = False
 
@@ -187,7 +283,12 @@ async def generate(
     preprocess_image: bool = Form(True),
 ):
     """Multipart upload -> binary GLB response."""
+    request_id = uuid.uuid4().hex[:8]
+    received_at = time.monotonic()
+    logger.info("[%s] HTTP request received filename=%r content_type=%r",
+                request_id, image.filename, image.content_type)
     if not state.ready:
+        logger.warning("[%s] rejected: model still loading", request_id)
         return JSONResponse({"error": "model still loading"}, status_code=503)
     params = GenParams(
         seed=seed, pipeline_type=pipeline_type, texture_size=texture_size,
@@ -195,14 +296,21 @@ async def generate(
         max_num_tokens=max_num_tokens, preprocess_image=preprocess_image,
     )
     try:
-        img = _decode_image(await image.read())
+        image_data = await image.read()
+        img = _decode_image(image_data)
+        logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s params=%s",
+                    request_id, len(image_data), img.width, img.height, img.mode,
+                    params.model_dump())
     except Exception as e:
+        logger.warning("[%s] invalid image: %s", request_id, e)
         return JSONResponse({"error": f"invalid image: {e}"}, status_code=400)
     try:
-        glb = await _generate(img, params)
+        glb = await _generate(img, params, request_id)
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("[%s] generation failed", request_id)
         return JSONResponse({"error": str(e)}, status_code=500)
+    logger.info("[%s] HTTP request completed status=200 bytes=%d elapsed=%.2fs",
+                request_id, len(glb), time.monotonic() - received_at)
     return Response(
         content=glb,
         media_type="model/gltf-binary",
@@ -218,42 +326,78 @@ async def ws_generate(ws: WebSocket):
       server -> {"stage": "queued"|"processing"|"exporting"|"done"|"error", ...}
       final  -> {"stage": "done", "glb_base64": "..."}
     """
+    request_id = uuid.uuid4().hex[:8]
     await ws.accept()
+    logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
     try:
         req = await ws.receive_json()
+        logger.info("[%s] WebSocket generation request received", request_id)
         if not state.ready:
+            logger.warning("[%s] rejected: model still loading", request_id)
             await ws.send_json({"stage": "error", "message": "model still loading"})
             await ws.close()
             return
         try:
-            img = _decode_image(base64.b64decode(req.pop("image_base64")))
+            image_data = base64.b64decode(req.pop("image_base64"), validate=True)
+            img = _decode_image(image_data)
         except Exception as e:
+            logger.warning("[%s] invalid image: %s", request_id, e)
             await ws.send_json({"stage": "error", "message": f"invalid image: {e}"})
             await ws.close()
             return
         params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields})
+        logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s params=%s",
+                    request_id, len(image_data), img.width, img.height, img.mode,
+                    params.model_dump())
 
         queued = state.gpu_lock.locked()
-        await ws.send_json({"stage": "queued", "queued": queued})
+        logger.info("[%s] queued=%s", request_id, queued)
+        await ws.send_json({
+            "stage": "queued", "queued": queued, "request_id": request_id
+        })
 
+        wait_started = time.monotonic()
         async with state.gpu_lock:
             state.busy = True
-            await ws.send_json({"stage": "processing"})
+            logger.info("[%s] GPU acquired after %.2fs", request_id,
+                        time.monotonic() - wait_started)
+            await ws.send_json({"stage": "processing", "progress": 0, "request_id": request_id})
             t0 = time.time()
             try:
-                glb = await asyncio.to_thread(_run_generation, img, params)
+                loop = asyncio.get_running_loop()
+
+                def send_progress(percent, stage, elapsed):
+                    message = {
+                        "stage": "processing", "step": stage,
+                        "progress": percent, "elapsed_sec": elapsed,
+                        "request_id": request_id,
+                    }
+                    future = asyncio.run_coroutine_threadsafe(ws.send_json(message), loop)
+                    try:
+                        future.result(timeout=5)
+                    except Exception:
+                        # Client progress delivery must never abort GPU work.
+                        future.cancel()
+
+                glb = await asyncio.to_thread(
+                    _run_generation, img, params, request_id, send_progress
+                )
             finally:
                 state.busy = False
             await ws.send_json({
                 "stage": "done",
                 "elapsed_sec": round(time.time() - t0, 2),
+                "progress": 100,
+                "request_id": request_id,
                 "glb_base64": base64.b64encode(glb).decode("ascii"),
             })
+        logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs",
+                    request_id, len(glb), time.time() - t0)
         await ws.close()
     except WebSocketDisconnect:
-        pass
+        logger.warning("[%s] WebSocket disconnected", request_id)
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("[%s] WebSocket generation failed", request_id)
         try:
             await ws.send_json({"stage": "error", "message": str(e)})
             await ws.close()
@@ -268,8 +412,23 @@ def main():
     args = parser.parse_args()
 
     import uvicorn
+
+    class HealthCheckFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return '"GET /health' not in msg and '"GET /health ' not in msg
+
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
+    log_config = uvicorn.config.LOGGING_CONFIG.copy()
+    log_config["formatters"] = {
+        name: {**formatter, "fmt": f"%(asctime)s.%(msecs)03d {formatter['fmt']}",
+               "datefmt": LOG_DATE_FORMAT}
+        for name, formatter in uvicorn.config.LOGGING_CONFIG["formatters"].items()
+    }
     # Single worker: the model is loaded once per process and the GPU is shared.
-    uvicorn.run(app, host=args.host, port=args.port, workers=1, ws_max_size=64 * 1024 * 1024)
+    uvicorn.run(app, host=args.host, port=args.port, workers=1,
+                ws_max_size=64 * 1024 * 1024, log_config=log_config)
 
 
 if __name__ == "__main__":

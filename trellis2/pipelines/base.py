@@ -78,7 +78,12 @@ class Pipeline:
             model.eval()
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Pipeline":
+    def from_pretrained(
+        cls,
+        path: str,
+        config_file: str = "pipeline.json",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> "Pipeline":
         """
         Load a pretrained model.
 
@@ -102,13 +107,22 @@ class Pipeline:
             from huggingface_hub import hf_hub_download
             config_file = hf_hub_download(path, config_file)
 
+        if progress_callback is not None:
+            progress_callback("reading pipeline configuration")
+
         with open(config_file, 'r') as f:
             args = json.load(f)['args']
 
         _models = {}
-        for k, v in args['models'].items():
-            if hasattr(cls, 'model_names_to_load') and k not in cls.model_names_to_load:
-                continue
+        models_to_load = [
+            (k, v) for k, v in args['models'].items()
+            if not hasattr(cls, 'model_names_to_load') or k in cls.model_names_to_load
+        ]
+        for index, (k, v) in enumerate(models_to_load, 1):
+            if progress_callback is not None:
+                progress_callback(
+                    f"loading checkpoint {index}/{len(models_to_load)}: {k}"
+                )
             if is_local_path:
                 _models[k] = _load_model_from_local(path, v)
             else:

@@ -31,6 +31,7 @@ def to_glb(
     mesh_cluster_smooth_strength=1,
     verbose: bool = False,
     use_tqdm: bool = False,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ):
     """
     Convert an extracted mesh to a GLB file.
@@ -56,7 +57,13 @@ def to_glb(
         mesh_cluster_smooth_strength: strength of smoothing for clustering in uv unwrapping
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
+        progress_callback: optional ``(percent, stage)`` progress callback
     """
+    def report(percent: int, stage: str) -> None:
+        if progress_callback is not None:
+            progress_callback(percent, stage)
+
+    report(0, "preparing mesh")
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):
         aabb = np.array(aabb)
@@ -111,6 +118,7 @@ def to_glb(
     if verbose:
         print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
     vertices, faces = mesh.read()
+    report(10, "initial mesh cleanup complete")
     if use_tqdm:
         pbar.update(1)
         
@@ -120,6 +128,7 @@ def to_glb(
     if verbose:
         print(f"Building BVH for current mesh...", end='', flush=True)
     bvh = cumesh.cuBVH(vertices, faces)
+    report(20, "BVH built")
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -132,6 +141,7 @@ def to_glb(
     
     # --- Branch 1: Standard Pipeline (Simplification & Cleaning) ---
     if not remesh:
+        report(25, "simplifying and cleaning mesh")
         # Step 1: Aggressive simplification (3x target)
         mesh.simplify(decimation_target * 3, verbose=verbose)
         if verbose:
@@ -163,6 +173,7 @@ def to_glb(
     
     # --- Branch 2: Remeshing Pipeline ---
     else:
+        report(25, "remeshing with dual contouring")
         center = aabb.mean(dim=0)
         scale = (aabb[1] - aabb[0]).max().item()
         resolution = grid_size.max().item()
@@ -185,6 +196,8 @@ def to_glb(
         mesh.simplify(decimation_target, verbose=verbose)
         if verbose:
             print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+
+    report(50, "mesh topology complete")
     
     if use_tqdm:
         pbar.update(1)
@@ -198,6 +211,7 @@ def to_glb(
     if verbose:
         print("Parameterizing new mesh...")
     
+    report(55, "unwrapping UVs")
     out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
         compute_charts_kwargs={
             "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
@@ -219,6 +233,7 @@ def to_glb(
         pbar.update(1)
     if verbose:
         print("Done")
+    report(70, "UV unwrapping complete")
     
     # --- Texture Baking (Attribute Sampling) ---
     if use_tqdm:
@@ -226,6 +241,7 @@ def to_glb(
     if verbose:
         print("Sampling attributes...", end='', flush=True)
         
+    report(75, "sampling texture attributes")
     # Setup differentiable rasterizer context
     ctx = dr.RasterizeCudaContext()
     # Prepare UV coordinates for rasterization (rendering in UV space)
@@ -268,6 +284,7 @@ def to_glb(
         pbar.update(1)
     if verbose:
         print("Done")
+    report(90, "texture attributes sampled")
     
     # --- Texture Post-Processing & Material Construction ---
     if use_tqdm:
@@ -275,6 +292,7 @@ def to_glb(
     if verbose:
         print("Finalizing mesh...", end='', flush=True)
     
+    report(92, "finalizing textures and material")
     mask = mask.cpu().numpy()
     
     # Extract channels based on layout (BaseColor, Metallic, Roughness, Alpha)
@@ -327,5 +345,7 @@ def to_glb(
         pbar.close()
     if verbose:
         print("Done")
+
+    report(100, "GLB mesh ready")
     
     return textured_mesh

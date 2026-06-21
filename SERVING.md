@@ -45,7 +45,7 @@ python serve.py --host 0.0.0.0 --port 8000
 | `GET` | `/health` | `200 {"status":"ok"}` when ready, `503` while loading |
 | `GET` | `/info` | Model path, device, busy state |
 | `POST` | `/generate` | multipart `image` upload → binary GLB |
-| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON; final message carries `glb_base64` |
+| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; final message carries `glb_base64` |
 
 Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
 `texture_size` (default 4096), `decimation_target` (default 1000000),
@@ -74,3 +74,17 @@ curl -X POST http://localhost:8086/generate \
     -F texture_size=4096 \
     -o out.glb
 ```
+
+## Logs and progress
+
+Service logs include millisecond timestamps and a short request ID. Each
+generation reports queue wait time and milestone progress from image
+preprocessing through GLB export. Follow them with:
+
+```bash
+docker logs --timestamps --follow trellis2
+```
+
+For client-side live progress, use the WebSocket mode shown above. Plain HTTP
+keeps the connection open until the GLB is complete, while its progress remains
+visible in the container logs.

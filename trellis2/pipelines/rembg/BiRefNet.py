@@ -1,15 +1,31 @@
 from typing import *
 from transformers import AutoModelForImageSegmentation
 import torch
+import warnings
 from torchvision import transforms
 from PIL import Image
 
 
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        # BiRefNet's remote model code still imports compatibility shims from
+        # timm.models.*.  timm 1.x supports them but emits a FutureWarning for
+        # each import.  Keep the filter local to remote-code loading so genuine
+        # deprecation warnings elsewhere remain visible.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Importing from timm\.models\.layers is deprecated.*",
+                category=FutureWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Importing from timm\.models\.registry is deprecated.*",
+                category=FutureWarning,
+            )
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                model_name, trust_remote_code=True
+            )
         self.model.eval()
         self.transform_image = transforms.Compose(
             [
@@ -39,4 +55,3 @@ class BiRefNet:
         mask = pred_pil.resize(image_size)
         image.putalpha(mask)
         return image
-    

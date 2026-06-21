@@ -12,6 +12,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - OPENCV_IO_ENABLE_OPENEXR=1
       - ATTN_BACKEND=flash-attn
+      # Service logs use structured milestones instead of carriage-return bars.
+      - TQDM_DISABLE=1
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
       - HF_HOME=/workspace/.cache/huggingface
       # Service-mode settings (used by `serve`)
       - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
@@ -30,8 +33,8 @@ services:
     ports:
       # Inference server (HTTP / WebSocket) — vLLM-style service mode
       - "8086:8000"
-    stdin_open: true
-    tty: true
+    # Do not allocate a pseudo-TTY for the service. On Windows, PTY newline
+    # conversion can turn each Docker log record into a visible blank line.
     # Run as a persistent service: model stays resident, clients hit HTTP/WS.
     command: serve
     healthcheck:
