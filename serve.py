@@ -179,18 +179,17 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
     pipeline = state.pipeline
     started_at = time.monotonic()
     last_report_at = started_at
-    stage_timings = []
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
     def report(percent: int, stage: str) -> None:
         nonlocal last_report_at
         now = time.monotonic()
-        stage_timings.append((stage, round(now - last_report_at, 3)))
+        delta = now - last_report_at
         last_report_at = now
-        elapsed = round(time.monotonic() - started_at, 2)
-        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs",
-                    request_id, percent, stage, elapsed)
+        elapsed = round(now - started_at, 2)
+        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
+                    request_id, percent, stage, elapsed, delta)
         if progress_callback is not None:
             progress_callback(percent, stage, elapsed)
 
@@ -256,14 +255,6 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         except OSError:
             pass
     report(100, f"complete ({len(data)} bytes)")
-    if torch.cuda.is_available():
-        logger.info(
-            "[%s] profile stages=%s peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
-            request_id,
-            stage_timings,
-            torch.cuda.max_memory_allocated() / 2**30,
-            torch.cuda.max_memory_reserved() / 2**30,
-        )
     return data
 
 
