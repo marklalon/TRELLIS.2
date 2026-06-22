@@ -11,6 +11,7 @@ Run:
 
 Environment variables:
     TRELLIS2_MODEL_PATH   Path/HF repo of the weights (default /models/microsoft/TRELLIS.2-4B)
+    TRELLIS2_REMBG_MODEL_PATH  Background-removal model path/repo
     TRELLIS2_PIPELINE     Default pipeline type: 512 / 1024 / 1024_cascade / 1536_cascade
 """
 import os
@@ -59,6 +60,7 @@ torch.backends.cudnn.benchmark = True
 
 
 MODEL_PATH = os.environ.get("TRELLIS2_MODEL_PATH", "/models/microsoft/TRELLIS.2-4B")
+REMBG_MODEL_PATH = os.environ.get("TRELLIS2_REMBG_MODEL_PATH")
 DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "512")
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
@@ -119,6 +121,7 @@ class _State:
     ready: bool = False
     loaded_at: float = 0.0
     busy: bool = False
+    rembg_warmup_status: str = "not_started"
 
 
 state = _State()
@@ -272,7 +275,8 @@ def _load_pipeline():
         spec.loader.exec_module(module)
         o_voxel.postprocess = module
 
-    logger.info("Loading pipeline from: %s", MODEL_PATH)
+    logger.info("Loading pipeline from: %s; background-removal model: %s",
+                MODEL_PATH, REMBG_MODEL_PATH or "pipeline default")
     # The whole pipeline stays resident in VRAM, so load checkpoint weights
     # straight onto the GPU to avoid a separate CPU->GPU copy.
     pipeline = _run_startup_stage(
@@ -283,6 +287,7 @@ def _load_pipeline():
                 "Startup progress: %s", message
             ),
             device="cuda",
+            rembg_model_path=REMBG_MODEL_PATH,
         ),
     )
     pipeline.default_pipeline_type = DEFAULT_PIPELINE
@@ -295,6 +300,36 @@ def _load_pipeline():
     state.loaded_at = time.time()
     logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
                 DEFAULT_PIPELINE)
+
+
+async def _background_rembg_warmup() -> None:
+    """Warm RMBG immediately after startup in the background."""
+    state.rembg_warmup_status = "running"
+    try:
+        rembg_model = getattr(state.pipeline, "rembg_model", None)
+        if rembg_model is None:
+            state.rembg_warmup_status = "skipped"
+            logger.info("Background-removal warmup skipped: no model")
+            return
+        if getattr(rembg_model, "warmed", False):
+            state.rembg_warmup_status = "complete"
+            logger.info("Background-removal model was warmed by a request")
+            return
+
+        started_at = time.monotonic()
+        logger.info("Background-removal warmup started source=%s",
+                    getattr(rembg_model, "warmup_source", "generated image"))
+        await asyncio.to_thread(rembg_model.warmup)
+        state.rembg_warmup_status = "complete"
+        logger.info("Background-removal warmup completed elapsed=%.2fs",
+                    time.monotonic() - started_at)
+    except asyncio.CancelledError:
+        state.rembg_warmup_status = "cancelled"
+        logger.info("Background-removal warmup cancelled")
+        raise
+    except Exception:
+        state.rembg_warmup_status = "failed"
+        logger.exception("Background-removal warmup failed")
 
 class _ProgressReporter:
     """Per-request progress/timing, shared across the sampling and
@@ -510,9 +545,15 @@ async def _watch_ws_cancellation(
 async def lifespan(app: FastAPI):
     # Load synchronously so /health only reports ready once the model is up.
     await asyncio.to_thread(_load_pipeline)
-    yield
-    state.pipeline = None
-    state.ready = False
+    warmup_task = asyncio.create_task(_background_rembg_warmup())
+    try:
+        yield
+    finally:
+        warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await warmup_task
+        state.pipeline = None
+        state.ready = False
 
 
 app = FastAPI(title="TRELLIS.2 Inference Server", version="1.0", lifespan=lifespan)
@@ -529,8 +570,10 @@ async def health():
 async def info():
     return {
         "model_path": MODEL_PATH,
+        "rembg_model_path": REMBG_MODEL_PATH,
         "ready": state.ready,
         "busy": state.busy,
+        "rembg_warmup_status": state.rembg_warmup_status,
         "default_pipeline_type": DEFAULT_PIPELINE,
         "loaded_at": state.loaded_at,
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,

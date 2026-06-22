@@ -100,6 +100,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         config_file: str = "pipeline.json",
         progress_callback: Optional[Callable[[str], None]] = None,
         device=None,
+        rembg_model_path: Optional[str] = None,
     ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
@@ -108,10 +109,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
             device: Optional device to load checkpoint weights directly onto
                     (e.g. ``"cuda"``). Defaults to CPU.
+            rembg_model_path: Optional local path or Hugging Face repository
+                              overriding the background-removal model in the
+                              pipeline configuration.
         """
         pipeline = super().from_pretrained(path, config_file, progress_callback, device=device)
         args = pipeline._pretrained_args
         is_local_path = getattr(pipeline, '_is_local_path', False)
+
+        if rembg_model_path is not None:
+            args['rembg_model']['args']['model_name'] = rembg_model_path
 
         # Resolve HF model names to local paths when loading from disk
         if is_local_path:

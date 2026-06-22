@@ -21,6 +21,7 @@ services:
       - HF_HOME=/workspace/.cache/huggingface
       # Service-mode settings (used by `serve`)
       - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
+      - TRELLIS2_REMBG_MODEL_PATH=/models/briaai/RMBG-1.4
       - TRELLIS2_PORT=8000
       - TRELLIS2_PIPELINE=512
     volumes:
