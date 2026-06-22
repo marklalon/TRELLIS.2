@@ -25,32 +25,35 @@ def _get_rasterize_context() -> "dr.RasterizeCudaContext":
     return _RASTERIZE_CONTEXT
 
 
-def _morton_order(points: torch.Tensor, bits: int = 10) -> torch.Tensor:
-    """Return the permutation that sorts ``points`` along a 3D Z-order (Morton) curve.
+def _pad_uv_seams(img: np.ndarray, valid: np.ndarray, iterations: int = 8) -> np.ndarray:
+    """Pad valid texels outward across UV-chart boundaries to kill black seams.
 
-    BVH closest-point queries are memory-bound and divergence-bound: threads that
-    query spatially-distant points walk different parts of the tree and thrash the
-    cache. Reordering the query points so that adjacent threads handle spatially
-    close points keeps a warp on coherent subtrees. ``bits`` per axis quantises the
-    points into a 2**bits grid before interleaving (10 bits -> 30-bit code, int64).
+    Grows the valid region one ring per iteration, averaging only valid
+    neighbours, so colour is preserved (no background bleed) and the work is
+    bounded by ``iterations`` instead of the empty area. Unlike
+    ``cv2.inpaint`` (TELEA), which is single-threaded and fills the *entire*
+    empty atlas, this only touches a few texels of padding around each chart —
+    the only region ever reached by bilinear / mip sampling.
+
+    Args:
+        img: HxWxC uint8 texture.
+        valid: HxW bool mask, True where ``img`` holds real (baked) data.
+        iterations: number of 1-texel dilation rings to fill.
     """
-    pts = points.detach()
-    lo = pts.amin(dim=0)
-    extent = (pts.amax(dim=0) - lo).clamp_min(1e-12)
-    # Quantise each axis to [0, 2**bits - 1].
-    q = ((pts - lo) / extent * (2 ** bits - 1)).clamp_(0, 2 ** bits - 1).to(torch.int64)
-
-    def _part1by2(n: torch.Tensor) -> torch.Tensor:
-        # Spread the low ``bits`` bits of n so each occupies every third bit slot.
-        n = n & 0x3FF
-        n = (n | (n << 16)) & 0x30000FF
-        n = (n | (n << 8)) & 0x300F00F
-        n = (n | (n << 4)) & 0x30C30C3
-        n = (n | (n << 2)) & 0x9249249
-        return n
-
-    code = _part1by2(q[:, 0]) | (_part1by2(q[:, 1]) << 1) | (_part1by2(q[:, 2]) << 2)
-    return torch.argsort(code)
+    out = img.astype(np.float32) * valid[..., None]
+    cnt = valid.astype(np.float32)
+    kernel = np.ones((3, 3), np.float32)
+    for _ in range(iterations):
+        frontier = (cnt < 0.5) & (cv2.dilate(cnt, kernel) > 0.5)
+        if not frontier.any():
+            break
+        nb_sum = cv2.filter2D(out, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        nb_cnt = cv2.filter2D(cnt, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        avg = nb_sum / np.maximum(nb_cnt, 1.0)[..., None]
+        f = frontier[..., None]
+        np.copyto(out, avg, where=f)
+        np.copyto(cnt, 1.0, where=frontier)
+    return out.clip(0, 255).astype(np.uint8)
 
 
 def to_glb(
@@ -309,19 +312,8 @@ def to_glb(
     valid_pos = pos[mask]
     
     # Map these positions back to the *original* high-res mesh to get accurate attributes
-    # This corrects geometric errors introduced by simplification/remeshing.
-    #
-    # The query points are in UV-space raster order, which carries no spatial
-    # coherence in 3D, so neighbouring BVH threads diverge and thrash the cache.
-    # Reorder the queries along a Morton curve, then scatter the results back to
-    # the original order. The closest-point query is independent per point, so the
-    # permutation is exact.
-    order = _morton_order(valid_pos)
-    _, face_id_s, uvw_s = bvh.unsigned_distance(valid_pos[order], return_uvw=True)
-    face_id = torch.empty_like(face_id_s)
-    uvw = torch.empty_like(uvw_s)
-    face_id[order] = face_id_s
-    uvw[order] = uvw_s
+    # This corrects geometric errors introduced by simplification/remeshing
+    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
     orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
     
@@ -351,23 +343,18 @@ def to_glb(
 
     # Scale, clamp, and cast to uint8 on the GPU before the single GPU->CPU
     # copy. This moves the per-texel arithmetic onto the GPU and transfers a
-    # quarter of the bytes (uint8 instead of float32). OpenCV supports
-    # three-channel inpainting, so the scalar PBR channels can also be filled
-    # together in one pass.
+    # quarter of the bytes (uint8 instead of float32).
     attrs_np = (attrs * 255).clamp_(0, 255).to(torch.uint8).cpu().numpy()
-    base_color = attrs_np[..., attr_layout['base_color']]
-    metallic = attrs_np[..., attr_layout['metallic']]
-    roughness = attrs_np[..., attr_layout['roughness']]
-    alpha = attrs_np[..., attr_layout['alpha']]
     alpha_mode = 'OPAQUE'
-    
-    # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
-    mask_inv = (~mask).astype(np.uint8)
-    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-    pbr = cv2.inpaint(
-        np.concatenate([metallic, roughness, alpha], axis=-1),
-        mask_inv, 1, cv2.INPAINT_TELEA,
-    )
+
+    # Pad gaps to prevent black seams at UV boundaries. Pack the scalar PBR
+    # channels together so they share a single fill pass.
+    base_color = _pad_uv_seams(attrs_np[..., attr_layout['base_color']], mask)
+    pbr = _pad_uv_seams(np.concatenate([
+        attrs_np[..., attr_layout['metallic']],
+        attrs_np[..., attr_layout['roughness']],
+        attrs_np[..., attr_layout['alpha']],
+    ], axis=-1), mask)
     metallic, roughness, alpha = np.split(pbr, 3, axis=-1)
 
     # Create PBR material
