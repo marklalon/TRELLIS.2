@@ -503,7 +503,7 @@ def main() -> None:
     parser.add_argument("--pipeline-type", default="512",
                         help="pipeline 类型 (default: 512)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--texture-size", type=int, default=1024)
+    parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--decimation-target", type=int, default=100000)
     parser.add_argument("--texture-sampling-steps", type=int, default=12)
     parser.add_argument("--shape-sampling-steps", type=int, default=12)

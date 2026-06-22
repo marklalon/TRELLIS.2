@@ -355,7 +355,7 @@ class Trellis2TexturingPipeline(Pipeline):
         tex_slat_sampler_params: dict = {},
         preprocess_image: bool = True,
         resolution: int = 1024,
-        texture_size: int = 1024,
+        texture_size: int = 2048,
     ) -> trimesh.Trimesh:
         """
         Run the pipeline.
