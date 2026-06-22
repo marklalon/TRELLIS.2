@@ -21,3 +21,32 @@ RUN pip install --no-cache-dir --force-reinstall pillow-simd \
 # the expensive CUDA extension layers.
 RUN sed -i '/torch\.cross(/{/dim=/!s/)$/, dim=-1)/;}' \
         /usr/local/lib/python3.10/dist-packages/cumesh/remeshing.py
+
+# Rebuild only the CPU-only xatlas packing extension from the patched CuMesh fork.
+# Upstream xatlas PackCharts submits one task scheduler task per chart; on meshes
+# with many small charts the submit/notify overhead dominates (addCharts measured
+# at ~3.95s of a 4.39s pack). The fork chunks charts into ~threadCount*4 tasks,
+# making UV packing ~9x faster with bit-identical output. Only _cumesh_xatlas is
+# recompiled (matching the base image's torch/ABI); the expensive CUDA extension
+# layers in the base image are reused untouched. Pinned to a fork commit for
+# reproducibility; bump the SHA to pick up later fixes.
+ARG CUMESH_XATLAS_REF=20d983f8e832c38c48526efb850fcd6abe8c2c64
+RUN set -eux; \
+    raw="https://raw.githubusercontent.com/marklalon/CuMesh/${CUMESH_XATLAS_REF}/third_party/xatlas"; \
+    mkdir -p /tmp/xatlas && cd /tmp/xatlas; \
+    curl -fsSL "$raw/xatlas.cpp"  -o xatlas.cpp; \
+    curl -fsSL "$raw/xatlas.h"    -o xatlas.h; \
+    curl -fsSL "$raw/binding.cpp" -o binding.cpp; \
+    printf '%s\n' \
+      'from setuptools import setup' \
+      'from torch.utils.cpp_extension import CppExtension, BuildExtension' \
+      'setup(ext_modules=[CppExtension("_cumesh_xatlas", ["xatlas.cpp", "binding.cpp"],' \
+      '      extra_compile_args=["-O3", "-std=c++17"])], cmdclass={"build_ext": BuildExtension})' \
+      > setup_xatlas.py; \
+    python setup_xatlas.py build_ext --inplace; \
+    cp _cumesh_xatlas*.so /usr/local/lib/python3.10/dist-packages/cumesh/; \
+    python -c "import torch, importlib.util, glob; \
+p = glob.glob('/usr/local/lib/python3.10/dist-packages/cumesh/_cumesh_xatlas*.so')[0]; \
+s = importlib.util.spec_from_file_location('_cumesh_xatlas', p); m = importlib.util.module_from_spec(s); \
+s.loader.exec_module(m); m.Atlas(); print('optimized _cumesh_xatlas loads OK:', p)"; \
+    cd / && rm -rf /tmp/xatlas
