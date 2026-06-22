@@ -20,7 +20,7 @@ services:
       # Service-mode settings (used by `serve`)
       - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
       - TRELLIS2_PORT=8000
-      - TRELLIS2_PIPELINE=1024_cascade
+      - TRELLIS2_PIPELINE=512
     volumes:
       # Mount the project source code (read-write for development)
       - .:/workspace/TRELLIS.2

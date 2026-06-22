@@ -59,7 +59,7 @@ torch.backends.cudnn.benchmark = True
 
 
 MODEL_PATH = os.environ.get("TRELLIS2_MODEL_PATH", "/models/microsoft/TRELLIS.2-4B")
-DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "1024_cascade")
+DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "512")
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
 )

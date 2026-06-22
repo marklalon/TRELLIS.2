@@ -34,7 +34,7 @@ python serve.py --host 0.0.0.0 --port 8000
 | Variable | Default | Meaning |
 |---|---|---|
 | `TRELLIS2_MODEL_PATH` | `/models/microsoft/TRELLIS.2-4B` | Weights path / HF repo |
-| `TRELLIS2_PIPELINE` | `1024_cascade` | Default pipeline type: `512` / `1024` / `1024_cascade` / `1536_cascade` |
+| `TRELLIS2_PIPELINE` | `512` | Default pipeline type: `512` / `1024` / `1024_cascade` / `1536_cascade` |
 | `TRELLIS2_PORT` | `8000` | Listen port |
 
 ## Endpoints
@@ -58,7 +58,7 @@ are required for acceptable mesh quality.
 # WebSocket (streams progress)
 python trellis2_client.py --image assets/example_image/T.png --output out.glb
 python trellis2_client.py --image in.png --output out.glb \
-    --server http://localhost:8086 --pipeline-type 1024_cascade
+    --server http://localhost:8086 --pipeline-type 512
 ```
 
 ### curl

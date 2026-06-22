@@ -500,8 +500,8 @@ def main() -> None:
                         help="最多使用 N 张不同图片 (default: 全部)")
 
     # 生成参数
-    parser.add_argument("--pipeline-type", default="1024_cascade",
-                        help="pipeline 类型 (default: 1024_cascade)")
+    parser.add_argument("--pipeline-type", default="512",
+                        help="pipeline 类型 (default: 512)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--decimation-target", type=int, default=100000)
