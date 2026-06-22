@@ -149,10 +149,16 @@ def from_pretrained(path: str, device=None, **kwargs):
     else:
         # CPU path: in-place load casts the checkpoint to each param's dtype.
         result = model.load_state_dict(state_dict, strict=False)
-    if getattr(result, "missing_keys", None):
+    # RoPE phases are deterministically rebuilt by the model constructor and
+    # are intentionally absent from some published checkpoints.
+    missing_keys = [
+        key for key in getattr(result, "missing_keys", [])
+        if key != "rope_phases"
+    ]
+    if missing_keys:
         logger.warning(
             "Checkpoint '%s' is missing %d key(s); those params keep uninitialized "
-            "values (e.g. %s)", path, len(result.missing_keys), result.missing_keys[:5]
+            "values (e.g. %s)", path, len(missing_keys), missing_keys[:5]
         )
 
     return model
