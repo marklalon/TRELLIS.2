@@ -44,7 +44,7 @@ python serve.py --host 0.0.0.0 --port 8000
 | `GET` | `/health` | `200 {"status":"ok"}` when ready, `503` while loading |
 | `GET` | `/info` | Model path, device, busy state |
 | `POST` | `/generate` | multipart `image` upload → binary GLB |
-| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; final message carries `glb_base64` |
+| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; supports cancellation; final message carries `glb_base64` |
 
 Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
 `texture_size` (default 2048), `decimation_target` (default 100000),
@@ -86,4 +86,13 @@ docker logs --follow trellis2
 ```
 
 The client uses WebSocket and displays generation progress in real time. The
-HTTP endpoint remains available for integrations such as `curl`.
+HTTP endpoint remains available for integrations such as `curl`. Disconnecting
+either an HTTP or WebSocket client cancels its queued/running generation. A
+WebSocket client can also cancel explicitly while the job is running:
+
+```json
+{"type": "cancel"}
+```
+
+The server confirms an explicit request with a `{"stage": "cancelled", ...}`
+message. `trellis2_client.py` sends this message automatically on Ctrl+C.

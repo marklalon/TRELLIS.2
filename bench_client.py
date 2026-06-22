@@ -154,24 +154,35 @@ async def _ws_request(
             ) as ws:
                 await ws.send(json.dumps(payload))
                 progress_count = 0
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    stage = msg.get("stage", "")
-                    if stage == "queued":
-                        continue
-                    elif stage == "processing":
-                        progress_count += 1
-                        continue
-                    elif stage == "done":
-                        glb_bytes = base64.b64decode(msg["glb_base64"])
-                        elapsed = time.monotonic() - t0
-                        return RequestResult(
-                            ok=True, protocol="ws", image=image_path,
-                            latency=elapsed, bytes_received=len(glb_bytes),
-                            total_progress_stages=progress_count,
+                try:
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        stage = msg.get("stage", "")
+                        if stage == "queued":
+                            continue
+                        elif stage == "processing":
+                            progress_count += 1
+                            continue
+                        elif stage == "done":
+                            glb_bytes = base64.b64decode(msg["glb_base64"])
+                            elapsed = time.monotonic() - t0
+                            return RequestResult(
+                                ok=True, protocol="ws", image=image_path,
+                                latency=elapsed, bytes_received=len(glb_bytes),
+                                total_progress_stages=progress_count,
+                            )
+                        elif stage == "cancelled":
+                            raise RuntimeError(msg.get("message", "cancelled"))
+                        elif stage == "error":
+                            raise RuntimeError(msg.get("message", "unknown"))
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(
+                            ws.send(json.dumps({"type": "cancel"}))
                         )
-                    elif stage == "error":
-                        raise RuntimeError(msg.get("message", "unknown"))
+                    except Exception:
+                        pass
+                    raise
                 raise RuntimeError("connection closed before result")
         except asyncio.TimeoutError:
             return RequestResult(

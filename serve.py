@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Callable, Optional, TypeVar
 
 LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
@@ -44,7 +44,7 @@ logger.info("Startup progress: importing runtime dependencies")
 _runtime_import_started = time.monotonic()
 import torch
 from PIL import Image
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
@@ -124,6 +124,113 @@ class _State:
 state = _State()
 
 
+class GenerationCancelled(Exception):
+    """Raised by worker threads when their request has been cancelled."""
+
+
+class _CancellationToken:
+    """Cancellation state shared safely by the event loop and worker threads."""
+
+    def __init__(self) -> None:
+        self._thread_event = threading.Event()
+        self._async_event = asyncio.Event()
+        self._loop = asyncio.get_running_loop()
+        self._reason = "generation cancelled"
+        self._reason_lock = threading.Lock()
+
+    @property
+    def reason(self) -> str:
+        with self._reason_lock:
+            return self._reason
+
+    @property
+    def cancelled(self) -> bool:
+        return self._thread_event.is_set()
+
+    def cancel(self, reason: str) -> None:
+        with self._reason_lock:
+            if self._thread_event.is_set():
+                return
+            self._reason = reason
+            self._thread_event.set()
+        try:
+            self._loop.call_soon_threadsafe(self._async_event.set)
+        except RuntimeError:
+            # The server loop may already be shutting down. Worker-side checks
+            # still see the threading event.
+            pass
+
+    async def wait(self) -> None:
+        await self._async_event.wait()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise GenerationCancelled(self.reason)
+
+
+@asynccontextmanager
+async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: _CancellationToken):
+    """Acquire a phase lock, but immediately remove cancelled queued work."""
+    cancellation.raise_if_cancelled()
+    acquire_task = asyncio.create_task(lock.acquire())
+    cancel_task = asyncio.create_task(cancellation.wait())
+    lock_held = False
+    try:
+        await asyncio.wait(
+            (acquire_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if cancellation.cancelled:
+            cancellation.raise_if_cancelled()
+
+        await acquire_task
+        lock_held = True
+        cancel_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cancel_task
+        yield
+    finally:
+        if not acquire_task.done():
+            acquire_task.cancel()
+        try:
+            acquired = await acquire_task
+        except asyncio.CancelledError:
+            acquired = False
+        if acquired and not lock_held:
+            lock_held = True
+        if not cancel_task.done():
+            cancel_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cancel_task
+        if lock_held:
+            lock.release()
+
+
+async def _to_thread_cancellable(
+    operation: Callable[..., T],
+    *args,
+    cancellation: _CancellationToken,
+) -> T:
+    """Keep a phase lock held until cancelled worker code has really stopped."""
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancellation.cancel("server request task cancelled")
+        # asyncio cannot forcibly stop a thread. Wait for its cooperative
+        # cancellation point before allowing another request onto the GPU.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except GenerationCancelled:
+                break
+        if worker.done() and not worker.cancelled():
+            with suppress(Exception):
+                worker.result()
+        raise
+
+
 # --------------------------------------------------------------------------- #
 # Generation parameters
 # --------------------------------------------------------------------------- #
@@ -195,13 +302,19 @@ class _ProgressReporter:
     continuous even though the two phases run under different locks (and
     possibly different worker threads)."""
 
-    def __init__(self, request_id: str, progress_callback=None):
+    def __init__(self, request_id: str, cancellation: _CancellationToken,
+                 progress_callback=None):
         self.request_id = request_id
+        self.cancellation = cancellation
         self.progress_callback = progress_callback
         self.started_at = time.monotonic()
         self.last_report_at = self.started_at
 
+    def raise_if_cancelled(self) -> None:
+        self.cancellation.raise_if_cancelled()
+
     def report(self, percent: int, stage: str) -> None:
+        self.raise_if_cancelled()
         now = time.monotonic()
         delta = now - self.last_report_at
         self.last_report_at = now
@@ -210,6 +323,7 @@ class _ProgressReporter:
                     self.request_id, percent, stage, elapsed, delta)
         if self.progress_callback is not None:
             self.progress_callback(percent, stage, elapsed)
+        self.raise_if_cancelled()
 
 
 @torch.inference_mode()
@@ -232,11 +346,16 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
         preprocess_image=params.preprocess_image,
+        sparse_structure_sampler_params={
+            "cancellation_callback": reporter.raise_if_cancelled,
+        },
         shape_slat_sampler_params={
             "steps": params.shape_sampling_steps,
+            "cancellation_callback": reporter.raise_if_cancelled,
         },
         tex_slat_sampler_params={
             "steps": params.texture_sampling_steps,
+            "cancellation_callback": reporter.raise_if_cancelled,
         },
         progress_callback=pipeline_progress,
     )[0]
@@ -294,7 +413,8 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
 
 
 async def _generate(image: Image.Image, params: GenParams, request_id: str,
-                    progress_callback=None) -> bytes:
+                    progress_callback=None,
+                    cancellation: Optional[_CancellationToken] = None) -> bytes:
     """Two-phase image -> GLB.
 
     Phase 1 (sampling) holds the sampling lock and saturates the GPU. Phase 2
@@ -302,33 +422,77 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
     releases the sampling lock the next queued request can start sampling while
     this request finishes its GPU-light GLB construction and export.
     """
-    reporter = _ProgressReporter(request_id, progress_callback)
+    cancellation = cancellation or _CancellationToken()
+    reporter = _ProgressReporter(request_id, cancellation, progress_callback)
 
     queued = state.sampling_lock.locked()
     logger.info("[%s] queued=%s", request_id, queued)
     wait_started = time.monotonic()
-    async with state.sampling_lock:
+    async with _acquire_or_cancel(state.sampling_lock, cancellation):
         state.busy = True
         logger.info("[%s] sampling lock acquired after %.2fs", request_id,
                     time.monotonic() - wait_started)
         try:
-            mesh = await asyncio.to_thread(_run_sampling, reporter, image, params)
+            mesh = await _to_thread_cancellable(
+                _run_sampling, reporter, image, params, cancellation=cancellation
+            )
         finally:
             state.busy = False
         if not OVERLAP_POSTPROCESS:
             # Serial fallback: keep the sampling lock held through the whole
             # post-processing tail so only one request uses the GPU at a time.
-            async with state.postprocess_lock:
-                return await asyncio.to_thread(_run_postprocess, reporter, mesh, params)
+            async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+                return await _to_thread_cancellable(
+                    _run_postprocess, reporter, mesh, params,
+                    cancellation=cancellation,
+                )
 
     # Overlap path: the sampling lock is released here; the next request can
     # sample while this one finishes post-processing under its own lock.
-    async with state.postprocess_lock:
-        return await asyncio.to_thread(_run_postprocess, reporter, mesh, params)
+    async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+        return await _to_thread_cancellable(
+            _run_postprocess, reporter, mesh, params, cancellation=cancellation
+        )
 
 
 def _decode_image(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
+
+
+async def _watch_http_disconnect(
+    request: Request, cancellation: _CancellationToken
+) -> None:
+    while not cancellation.cancelled:
+        if await request.is_disconnected():
+            cancellation.cancel("HTTP client disconnected")
+            return
+        await asyncio.sleep(0.25)
+
+
+async def _watch_ws_cancellation(
+    ws: WebSocket, cancellation: _CancellationToken, request_id: str
+) -> bool:
+    """Return True for an explicit cancel message, False for a disconnect."""
+    try:
+        while True:
+            message = await ws.receive_json()
+            message_type = message.get("type", message.get("action", ""))
+            if str(message_type).lower() in {"cancel", "interrupt"}:
+                logger.info("[%s] explicit cancellation requested", request_id)
+                cancellation.cancel("client requested cancellation")
+                return True
+            logger.warning("[%s] ignoring WebSocket message type=%r",
+                           request_id, message_type)
+    except WebSocketDisconnect:
+        logger.warning("[%s] WebSocket disconnected; cancelling generation",
+                       request_id)
+        cancellation.cancel("WebSocket client disconnected")
+        return False
+    except RuntimeError:
+        # Starlette raises RuntimeError when receive() observes a connection
+        # that has already transitioned to the disconnected state.
+        cancellation.cancel("WebSocket client disconnected")
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +531,7 @@ async def info():
 
 @app.post("/generate")
 async def generate(
+    request: Request,
     image: UploadFile = File(..., description="Input image (png/jpg/webp)"),
     seed: int = Form(42),
     pipeline_type: Optional[str] = Form(None),
@@ -402,11 +567,24 @@ async def generate(
     except Exception as e:
         logger.warning("[%s] invalid image: %s", request_id, e)
         return JSONResponse({"error": f"invalid image: {e}"}, status_code=400)
+    cancellation = _CancellationToken()
+    disconnect_watcher = asyncio.create_task(
+        _watch_http_disconnect(request, cancellation)
+    )
     try:
-        glb = await _generate(img, params, request_id)
+        glb = await _generate(
+            img, params, request_id, cancellation=cancellation
+        )
+    except GenerationCancelled as e:
+        logger.info("[%s] HTTP generation cancelled: %s", request_id, e)
+        return JSONResponse({"error": str(e), "request_id": request_id}, status_code=499)
     except Exception as e:
         logger.exception("[%s] generation failed", request_id)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        disconnect_watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await disconnect_watcher
     logger.info("[%s] HTTP request completed status=200 bytes=%d elapsed=%.2fs",
                 request_id, len(glb), time.monotonic() - received_at)
     return Response(
@@ -421,10 +599,14 @@ async def ws_generate(ws: WebSocket):
     """
     Protocol:
       client -> {"image_base64": "...", ...params}
-      server -> {"stage": "queued"|"processing"|"exporting"|"done"|"error", ...}
+      client -> {"type": "cancel"}  (while generation is running)
+      server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
       final  -> {"stage": "done", "glb_base64": "..."}
     """
     request_id = uuid.uuid4().hex[:8]
+    cancellation = None
+    generation_task = None
+    receiver_task = None
     await ws.accept()
     logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
     try:
@@ -449,6 +631,7 @@ async def ws_generate(ws: WebSocket):
                     params.model_dump())
 
         loop = asyncio.get_running_loop()
+        cancellation = _CancellationToken()
 
         def send_progress(percent, stage, elapsed):
             message = {
@@ -460,8 +643,8 @@ async def ws_generate(ws: WebSocket):
             try:
                 future.result(timeout=5)
             except Exception:
-                # Client progress delivery must never abort GPU work.
                 future.cancel()
+                cancellation.cancel("WebSocket client disconnected")
 
         queued = state.sampling_lock.locked()
         logger.info("[%s] queued=%s", request_id, queued)
@@ -473,7 +656,43 @@ async def ws_generate(ws: WebSocket):
         t0 = time.time()
         # Locking (and the sampling/post-processing phase split) lives in
         # _generate so HTTP and WebSocket share one scheduling path.
-        glb = await _generate(img, params, request_id, send_progress)
+        generation_task = asyncio.create_task(
+            _generate(
+                img, params, request_id, send_progress,
+                cancellation=cancellation,
+            )
+        )
+        receiver_task = asyncio.create_task(
+            _watch_ws_cancellation(ws, cancellation, request_id)
+        )
+        done, _ = await asyncio.wait(
+            (generation_task, receiver_task), return_when=asyncio.FIRST_COMPLETED
+        )
+
+        explicit_cancel = False
+        if receiver_task in done:
+            explicit_cancel = receiver_task.result()
+
+        if cancellation.cancelled:
+            try:
+                await generation_task
+            except GenerationCancelled:
+                pass
+            if explicit_cancel:
+                await ws.send_json({
+                    "stage": "cancelled",
+                    "message": cancellation.reason,
+                    "request_id": request_id,
+                })
+                await ws.close()
+            logger.info("[%s] WebSocket generation cancelled: %s",
+                        request_id, cancellation.reason)
+            return
+
+        receiver_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await receiver_task
+        glb = await generation_task
         await ws.send_json({
             "stage": "done",
             "elapsed_sec": round(time.time() - t0, 2),
@@ -486,6 +705,8 @@ async def ws_generate(ws: WebSocket):
         await ws.close()
     except WebSocketDisconnect:
         logger.warning("[%s] WebSocket disconnected", request_id)
+    except GenerationCancelled as e:
+        logger.info("[%s] WebSocket generation cancelled: %s", request_id, e)
     except Exception as e:
         logger.exception("[%s] WebSocket generation failed", request_id)
         try:
@@ -493,6 +714,15 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+    finally:
+        if receiver_task is not None and not receiver_task.done():
+            receiver_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await receiver_task
+        if generation_task is not None and not generation_task.done():
+            cancellation.cancel("WebSocket handler stopped")
+            with suppress(asyncio.CancelledError, GenerationCancelled, Exception):
+                await asyncio.shield(generation_task)
 
 
 def main():

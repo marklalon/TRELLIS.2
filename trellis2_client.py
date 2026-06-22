@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from contextlib import suppress
 
 def _websocket_url(server: str) -> str:
     base = server.rstrip("/")
@@ -90,35 +91,45 @@ async def _run(args) -> None:
         ) as ws:
             await ws.send(json.dumps(payload))
 
-            async for raw_message in ws:
-                message = json.loads(raw_message)
-                stage = message.get("stage", "unknown")
+            try:
+                async for raw_message in ws:
+                    message = json.loads(raw_message)
+                    stage = message.get("stage", "unknown")
 
-                if stage == "queued":
-                    if message.get("queued"):
-                        print("[client] queued; waiting for the GPU")
+                    if stage == "queued":
+                        if message.get("queued"):
+                            print("[client] queued; waiting for the GPU")
+                        else:
+                            print("[client] GPU is available; starting generation")
+                    elif stage == "processing":
+                        progress.update(
+                            message.get("progress", 0),
+                            message.get("step", "processing"),
+                            message.get("elapsed_sec"),
+                        )
+                    elif stage == "done":
+                        progress.update(100, "complete", message.get("elapsed_sec"))
+                        progress.finish()
+                        glb = base64.b64decode(message["glb_base64"])
+                        output_dir = os.path.dirname(os.path.abspath(args.output))
+                        os.makedirs(output_dir, exist_ok=True)
+                        with open(args.output, "wb") as f:
+                            f.write(glb)
+                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        return
+                    elif stage == "cancelled":
+                        raise asyncio.CancelledError(message.get("message"))
+                    elif stage == "error":
+                        raise RuntimeError(message.get("message", "unknown server error"))
                     else:
-                        print("[client] GPU is available; starting generation")
-                elif stage == "processing":
-                    progress.update(
-                        message.get("progress", 0),
-                        message.get("step", "processing"),
-                        message.get("elapsed_sec"),
-                    )
-                elif stage == "done":
-                    progress.update(100, "complete", message.get("elapsed_sec"))
-                    progress.finish()
-                    glb = base64.b64decode(message["glb_base64"])
-                    output_dir = os.path.dirname(os.path.abspath(args.output))
-                    os.makedirs(output_dir, exist_ok=True)
-                    with open(args.output, "wb") as f:
-                        f.write(glb)
-                    print(f"[client] saved {len(glb)} bytes -> {args.output}")
-                    return
-                elif stage == "error":
-                    raise RuntimeError(message.get("message", "unknown server error"))
-                else:
-                    print(f"[client] server stage: {stage}")
+                        print(f"[client] server stage: {stage}")
+            except asyncio.CancelledError:
+                # asyncio.run turns Ctrl+C into task cancellation first. Send
+                # the protocol-level message before the context closes so the
+                # server can stop without waiting for disconnect detection.
+                with suppress(Exception):
+                    await asyncio.shield(ws.send(json.dumps({"type": "cancel"})))
+                raise
 
             raise RuntimeError("WebSocket closed before the result was received")
     finally:

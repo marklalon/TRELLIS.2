@@ -93,6 +93,7 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        cancellation_callback: Optional[Callable[[], None]] = None,
         **kwargs
     ):
         """
@@ -106,6 +107,8 @@ class FlowEulerSampler(Sampler):
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            cancellation_callback: Optional check run before and after every
+                sampling step. It may raise to stop sampling cooperatively.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -121,7 +124,11 @@ class FlowEulerSampler(Sampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+            if cancellation_callback is not None:
+                cancellation_callback()
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+            if cancellation_callback is not None:
+                cancellation_callback()
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
