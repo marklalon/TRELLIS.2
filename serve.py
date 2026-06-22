@@ -237,7 +237,7 @@ async def _to_thread_cancellable(
 class GenParams(BaseModel):
     seed: int = 42
     pipeline_type: Optional[str] = None          # default -> DEFAULT_PIPELINE
-    texture_size: int = 2048
+    texture_size: int = 1024
     decimation_target: int = 100000
     simplify: int = 16777216                     # nvdiffrast vertex limit
     max_num_tokens: int = 49152
@@ -543,7 +543,7 @@ async def generate(
     image: UploadFile = File(..., description="Input image (png/jpg/webp)"),
     seed: int = Form(42),
     pipeline_type: Optional[str] = Form(None),
-    texture_size: int = Form(2048),
+    texture_size: int = Form(1024),
     decimation_target: int = Form(100000),
     simplify: int = Form(16777216),
     max_num_tokens: int = Form(49152),

@@ -66,7 +66,7 @@ def to_glb(
     voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     decimation_target: int = 1000000,
-    texture_size: int = 2048,
+    texture_size: int = 1024,
     remesh: bool = False,
     remesh_band: float = 1,
     remesh_project: float = 0.9,

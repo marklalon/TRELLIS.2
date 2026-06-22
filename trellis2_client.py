@@ -153,7 +153,7 @@ def main() -> None:
         help="512 / 1024 / 1024_cascade / 1536_cascade (default: 512)",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--texture-size", type=int, default=2048)
+    parser.add_argument("--texture-size", type=int, default=1024)
     parser.add_argument("--decimation-target", type=int, default=100000)
     parser.add_argument(
         "--texture-sampling-steps",

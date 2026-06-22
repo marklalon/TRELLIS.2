@@ -121,7 +121,7 @@ mesh = o_voxel.postprocess.to_glb(
     grid_size=RES,
     aabb=[[-0.5,-0.5,-0.5],[0.5,0.5,0.5]],
     decimation_target=100000,
-    texture_size=2048,
+    texture_size=1024,
     verbose=True,
 )
 mesh.export("rec_helmet.glb")

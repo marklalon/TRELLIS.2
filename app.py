@@ -529,7 +529,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
-            texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
+            texture_size = gr.Slider(1024, 4096, label="Texture Size", value=1024, step=1024)
             
             generate_btn = gr.Button("Generate")
                 
