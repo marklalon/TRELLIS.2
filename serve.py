@@ -63,6 +63,10 @@ DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "1024_cascade")
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
 )
+# Overlap one request's GPU-light post-processing with the next request's
+# sampling. Set to 0 to fall back to fully serial generation (e.g. if VRAM is
+# too tight to keep one finished mesh resident while another request samples).
+OVERLAP_POSTPROCESS = os.environ.get("TRELLIS2_OVERLAP_POSTPROCESS", "1") == "1"
 o_voxel = None
 T = TypeVar("T")
 
@@ -96,9 +100,22 @@ def _run_startup_stage(label: str, operation: Callable[[], T]) -> T:
 
 class _State:
     pipeline: Optional[object] = None
-    # Only one generation may touch the GPU at a time; this lock turns the
-    # server into a single-worker queue while still accepting many connections.
-    gpu_lock: asyncio.Lock = asyncio.Lock()
+    # Generation is split into two phases with separate locks so the GPU-light
+    # post-processing tail of one request (cumesh UV/BVH/remesh, GLB export —
+    # latency-bound work that barely touches the GPU) can overlap the GPU-heavy
+    # sampling phase of the next request.
+    #
+    #   sampling_lock    - held during model sampling + VAE decode (saturates
+    #                      the GPU); strictly one at a time.
+    #   postprocess_lock - held during to_glb + export; one at a time because it
+    #                      guards non-reentrant cumesh state and the shared
+    #                      nvdiffrast rasterizer context.
+    #
+    # A request acquires the two locks in sequence and never holds both at once,
+    # so there is no deadlock; request B can sample while request A finishes its
+    # post-processing.
+    sampling_lock: asyncio.Lock = asyncio.Lock()
+    postprocess_lock: asyncio.Lock = asyncio.Lock()
     ready: bool = False
     loaded_at: float = 0.0
     busy: bool = False
@@ -172,31 +189,42 @@ def _load_pipeline():
     logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
                 DEFAULT_PIPELINE)
 
+class _ProgressReporter:
+    """Per-request progress/timing, shared across the sampling and
+    post-processing phases so the reported percentages and elapsed time stay
+    continuous even though the two phases run under different locks (and
+    possibly different worker threads)."""
+
+    def __init__(self, request_id: str, progress_callback=None):
+        self.request_id = request_id
+        self.progress_callback = progress_callback
+        self.started_at = time.monotonic()
+        self.last_report_at = self.started_at
+
+    def report(self, percent: int, stage: str) -> None:
+        now = time.monotonic()
+        delta = now - self.last_report_at
+        self.last_report_at = now
+        elapsed = round(now - self.started_at, 2)
+        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
+                    self.request_id, percent, stage, elapsed, delta)
+        if self.progress_callback is not None:
+            self.progress_callback(percent, stage, elapsed)
+
+
 @torch.inference_mode()
-def _run_generation(image: Image.Image, params: GenParams, request_id: str,
-                    progress_callback=None) -> bytes:
-    """Blocking image -> GLB. Must be called inside the GPU lock."""
+def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
+                  params: GenParams):
+    """GPU-heavy phase: model sampling + VAE decode. Must run under the
+    sampling lock. Returns the decoded mesh (GPU-resident)."""
     pipeline = state.pipeline
-    started_at = time.monotonic()
-    last_report_at = started_at
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-
-    def report(percent: int, stage: str) -> None:
-        nonlocal last_report_at
-        now = time.monotonic()
-        delta = now - last_report_at
-        last_report_at = now
-        elapsed = round(now - started_at, 2)
-        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
-                    request_id, percent, stage, elapsed, delta)
-        if progress_callback is not None:
-            progress_callback(percent, stage, elapsed)
 
     def pipeline_progress(percent: int, stage: str) -> None:
         # The model pipeline is about 70% of the complete request; the rest is
         # mesh cleanup, GLB construction and file export.
-        report(5 + round(percent * 0.65), stage)
+        reporter.report(5 + round(percent * 0.65), stage)
 
     mesh = pipeline.run(
         image,
@@ -212,13 +240,20 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         },
         progress_callback=pipeline_progress,
     )[0]
-    report(72, "simplifying mesh")
+    reporter.report(72, "simplifying mesh")
     mesh.simplify(params.simplify)
+    return mesh
 
-    report(78, "building GLB textures and materials")
+
+@torch.inference_mode()
+def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> bytes:
+    """GPU-light phase: GLB texturing/geometry (cumesh) + export. Must run
+    under the post-processing lock. This is the latency-bound tail that barely
+    uses the GPU, so it is allowed to overlap the next request's sampling."""
+    reporter.report(78, "building GLB textures and materials")
 
     def postprocess_progress(percent: int, stage: str) -> None:
-        report(78 + round(percent * 0.17), stage)
+        reporter.report(78 + round(percent * 0.17), stage)
 
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
@@ -241,7 +276,7 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
     with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        report(95, "exporting GLB")
+        reporter.report(95, "exporting GLB")
         # WebP texture encoding is markedly faster than PNG's single-threaded
         # zlib path and produces smaller GLBs. Requires Pillow built with WebP
         # support (libwebp-dev) and a client/viewer that understands the
@@ -254,22 +289,42 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
             os.remove(tmp_path)
         except OSError:
             pass
-    report(100, f"complete ({len(data)} bytes)")
+    reporter.report(100, f"complete ({len(data)} bytes)")
     return data
 
 
-async def _generate(image: Image.Image, params: GenParams, request_id: str) -> bytes:
-    queued = state.gpu_lock.locked()
+async def _generate(image: Image.Image, params: GenParams, request_id: str,
+                    progress_callback=None) -> bytes:
+    """Two-phase image -> GLB.
+
+    Phase 1 (sampling) holds the sampling lock and saturates the GPU. Phase 2
+    (post-processing) holds only the post-processing lock, so once phase 1
+    releases the sampling lock the next queued request can start sampling while
+    this request finishes its GPU-light GLB construction and export.
+    """
+    reporter = _ProgressReporter(request_id, progress_callback)
+
+    queued = state.sampling_lock.locked()
     logger.info("[%s] queued=%s", request_id, queued)
     wait_started = time.monotonic()
-    async with state.gpu_lock:
+    async with state.sampling_lock:
         state.busy = True
-        logger.info("[%s] GPU acquired after %.2fs", request_id,
+        logger.info("[%s] sampling lock acquired after %.2fs", request_id,
                     time.monotonic() - wait_started)
         try:
-            return await asyncio.to_thread(_run_generation, image, params, request_id)
+            mesh = await asyncio.to_thread(_run_sampling, reporter, image, params)
         finally:
             state.busy = False
+        if not OVERLAP_POSTPROCESS:
+            # Serial fallback: keep the sampling lock held through the whole
+            # post-processing tail so only one request uses the GPU at a time.
+            async with state.postprocess_lock:
+                return await asyncio.to_thread(_run_postprocess, reporter, mesh, params)
+
+    # Overlap path: the sampling lock is released here; the next request can
+    # sample while this one finishes post-processing under its own lock.
+    async with state.postprocess_lock:
+        return await asyncio.to_thread(_run_postprocess, reporter, mesh, params)
 
 
 def _decode_image(data: bytes) -> Image.Image:
@@ -393,47 +448,39 @@ async def ws_generate(ws: WebSocket):
                     request_id, len(image_data), img.width, img.height, img.mode,
                     params.model_dump())
 
-        queued = state.gpu_lock.locked()
+        loop = asyncio.get_running_loop()
+
+        def send_progress(percent, stage, elapsed):
+            message = {
+                "stage": "processing", "step": stage,
+                "progress": percent, "elapsed_sec": elapsed,
+                "request_id": request_id,
+            }
+            future = asyncio.run_coroutine_threadsafe(ws.send_json(message), loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                # Client progress delivery must never abort GPU work.
+                future.cancel()
+
+        queued = state.sampling_lock.locked()
         logger.info("[%s] queued=%s", request_id, queued)
         await ws.send_json({
             "stage": "queued", "queued": queued, "request_id": request_id
         })
+        await ws.send_json({"stage": "processing", "progress": 0, "request_id": request_id})
 
-        wait_started = time.monotonic()
-        async with state.gpu_lock:
-            state.busy = True
-            logger.info("[%s] GPU acquired after %.2fs", request_id,
-                        time.monotonic() - wait_started)
-            await ws.send_json({"stage": "processing", "progress": 0, "request_id": request_id})
-            t0 = time.time()
-            try:
-                loop = asyncio.get_running_loop()
-
-                def send_progress(percent, stage, elapsed):
-                    message = {
-                        "stage": "processing", "step": stage,
-                        "progress": percent, "elapsed_sec": elapsed,
-                        "request_id": request_id,
-                    }
-                    future = asyncio.run_coroutine_threadsafe(ws.send_json(message), loop)
-                    try:
-                        future.result(timeout=5)
-                    except Exception:
-                        # Client progress delivery must never abort GPU work.
-                        future.cancel()
-
-                glb = await asyncio.to_thread(
-                    _run_generation, img, params, request_id, send_progress
-                )
-            finally:
-                state.busy = False
-            await ws.send_json({
-                "stage": "done",
-                "elapsed_sec": round(time.time() - t0, 2),
-                "progress": 100,
-                "request_id": request_id,
-                "glb_base64": base64.b64encode(glb).decode("ascii"),
-            })
+        t0 = time.time()
+        # Locking (and the sampling/post-processing phase split) lives in
+        # _generate so HTTP and WebSocket share one scheduling path.
+        glb = await _generate(img, params, request_id, send_progress)
+        await ws.send_json({
+            "stage": "done",
+            "elapsed_sec": round(time.time() - t0, 2),
+            "progress": 100,
+            "request_id": request_id,
+            "glb_base64": base64.b64encode(glb).decode("ascii"),
+        })
         logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs",
                     request_id, len(glb), time.time() - t0)
         await ws.close()
