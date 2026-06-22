@@ -236,7 +236,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling sparse structure",
         ).samples
 
@@ -276,7 +276,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling shape SLat",
         ).samples
 
@@ -317,7 +317,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             noise,
             **lr_cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling shape SLat",
         ).samples
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
@@ -351,7 +351,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling shape SLat",
         ).samples
 
@@ -409,7 +409,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             concat_cond=shape_slat,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling texture SLat",
         ).samples
 

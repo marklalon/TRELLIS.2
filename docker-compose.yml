@@ -1,14 +1,15 @@
-version: "3.8"
-
 services:
   trellis2:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: trellis2:latest
+      dockerfile: Dockerfile.final
+      args:
+        BASE_IMAGE: trellis2:base
+    image: trellis2:final
     container_name: trellis2
     runtime: nvidia
     environment:
+      - TZ=Asia/Shanghai
       - NVIDIA_VISIBLE_DEVICES=all
       - OPENCV_IO_ENABLE_OPENEXR=1
       - ATTN_BACKEND=flash-attn

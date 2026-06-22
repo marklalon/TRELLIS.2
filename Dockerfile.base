@@ -1,4 +1,4 @@
-# TRELLIS.2 Docker Image
+# TRELLIS.2 Base Docker Image
 # Base: CUDA 12.8.1 + cuDNN devel (Blackwell sm_120)
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 

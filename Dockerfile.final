@@ -1,0 +1,8 @@
+# Lightweight final derivative of the existing, fully built TRELLIS.2 base image.
+# This keeps the expensive CUDA and extension layers untouched.
+ARG BASE_IMAGE=trellis2:base
+FROM ${BASE_IMAGE}
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && \
+    rm -rf /var/lib/apt/lists/*

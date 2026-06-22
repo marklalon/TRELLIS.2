@@ -50,6 +50,13 @@ from pydantic import BaseModel
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
             time.monotonic() - _runtime_import_started)
 
+# The flow models already use BF16, while decoders and post-processing still
+# contain FP32 GEMMs/convolutions. TF32 is substantially faster on recent NVIDIA
+# GPUs and retains the FP32 output/range expected by those components.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 
 MODEL_PATH = os.environ.get("TRELLIS2_MODEL_PATH", "/models/microsoft/TRELLIS.2-4B")
 DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "1024_cascade")
@@ -106,8 +113,8 @@ state = _State()
 class GenParams(BaseModel):
     seed: int = 42
     pipeline_type: Optional[str] = None          # default -> DEFAULT_PIPELINE
-    texture_size: int = 4096
-    decimation_target: int = 1000000
+    texture_size: int = 2048
+    decimation_target: int = 100000
     simplify: int = 16777216                     # nvdiffrast vertex limit
     max_num_tokens: int = 49152
     preprocess_image: bool = True
@@ -125,6 +132,19 @@ def _load_pipeline():
         "importing mesh post-processing modules",
         lambda: importlib.import_module("o_voxel"),
     )
+    # The package contains a compiled extension, so import the installed package
+    # first, then overlay its pure-Python postprocessor from the mounted source.
+    # Service restarts now pick up post-processing changes without recompiling.
+    local_postprocess = os.path.join(
+        os.path.dirname(__file__), "o-voxel", "o_voxel", "postprocess.py"
+    )
+    if os.path.isfile(local_postprocess):
+        spec = importlib.util.spec_from_file_location(
+            "o_voxel._workspace_postprocess", local_postprocess
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        o_voxel.postprocess = module
 
     logger.info("Loading pipeline from: %s", MODEL_PATH)
     # The whole pipeline stays resident in VRAM, so load checkpoint weights
@@ -150,14 +170,22 @@ def _load_pipeline():
     logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
                 DEFAULT_PIPELINE)
 
-
+@torch.inference_mode()
 def _run_generation(image: Image.Image, params: GenParams, request_id: str,
                     progress_callback=None) -> bytes:
     """Blocking image -> GLB. Must be called inside the GPU lock."""
     pipeline = state.pipeline
     started_at = time.monotonic()
+    last_report_at = started_at
+    stage_timings = []
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     def report(percent: int, stage: str) -> None:
+        nonlocal last_report_at
+        now = time.monotonic()
+        stage_timings.append((stage, round(now - last_report_at, 3)))
+        last_report_at = now
         elapsed = round(time.monotonic() - started_at, 2)
         logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs",
                     request_id, percent, stage, elapsed)
@@ -182,6 +210,9 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
 
     report(78, "building GLB textures and materials")
 
+    def postprocess_progress(percent: int, stage: str) -> None:
+        report(78 + round(percent * 0.17), stage)
+
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
@@ -196,6 +227,7 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         remesh_band=1,
         remesh_project=0,
         verbose=False,
+        progress_callback=postprocess_progress,
     )
 
     # Export to a temp file then read bytes (to_glb returns a trimesh object).
@@ -211,8 +243,15 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
             os.remove(tmp_path)
         except OSError:
             pass
-    torch.cuda.empty_cache()
     report(100, f"complete ({len(data)} bytes)")
+    if torch.cuda.is_available():
+        logger.info(
+            "[%s] profile stages=%s peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
+            request_id,
+            stage_timings,
+            torch.cuda.max_memory_allocated() / 2**30,
+            torch.cuda.max_memory_reserved() / 2**30,
+        )
     return data
 
 
@@ -273,8 +312,8 @@ async def generate(
     image: UploadFile = File(..., description="Input image (png/jpg/webp)"),
     seed: int = Form(42),
     pipeline_type: Optional[str] = Form(None),
-    texture_size: int = Form(4096),
-    decimation_target: int = Form(1000000),
+    texture_size: int = Form(2048),
+    decimation_target: int = Form(100000),
     simplify: int = Form(16777216),
     max_num_tokens: int = Form(49152),
     preprocess_image: bool = Form(True),

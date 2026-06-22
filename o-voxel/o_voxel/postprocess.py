@@ -122,7 +122,8 @@ def to_glb(
     if use_tqdm:
         pbar.update(1)
         
-    # Build BVH for the current mesh to guide remeshing
+    # Build BVH for the current mesh to guide remeshing and project texture
+    # samples back to the original high-resolution surface.
     if use_tqdm:
         pbar.set_description("Building BVH")
     if verbose:
@@ -294,20 +295,25 @@ def to_glb(
     
     report(92, "finalizing textures and material")
     mask = mask.cpu().numpy()
-    
-    # Extract channels based on layout (BaseColor, Metallic, Roughness, Alpha)
-    base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+
+    # Transfer the attribute texture once instead of issuing four sequential
+    # GPU->CPU copies. OpenCV supports three-channel inpainting, so the scalar
+    # PBR channels can also be filled together in one pass.
+    attrs_np = np.clip(attrs.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    base_color = attrs_np[..., attr_layout['base_color']]
+    metallic = attrs_np[..., attr_layout['metallic']]
+    roughness = attrs_np[..., attr_layout['roughness']]
+    alpha = attrs_np[..., attr_layout['alpha']]
     alpha_mode = 'OPAQUE'
     
     # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
     mask_inv = (~mask).astype(np.uint8)
     base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    pbr = cv2.inpaint(
+        np.concatenate([metallic, roughness, alpha], axis=-1),
+        mask_inv, 1, cv2.INPAINT_TELEA,
+    )
+    metallic, roughness, alpha = np.split(pbr, 3, axis=-1)
     
     # Create PBR material
     # Standard PBR packs Metallic and Roughness into Blue and Green channels

@@ -9,6 +9,28 @@ __all__ = [
 ]
 
 
+# FlashAttention metadata depends only on per-sample sequence lengths. Sparse
+# transformer blocks reuse the same layouts many hundreds of times per request;
+# caching avoids repeatedly building CPU tensors and copying them to CUDA.
+_CU_SEQLENS_CACHE = {}
+
+
+def _get_cu_seqlens(seqlens: List[int], device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index, tuple(seqlens))
+    cached = _CU_SEQLENS_CACHE.get(key)
+    if cached is None:
+        offsets = [0]
+        for length in seqlens:
+            offsets.append(offsets[-1] + length)
+        cached = torch.tensor(offsets, dtype=torch.int32, device=device)
+        # Requests can vary in token count. Keep this tiny cache bounded so a
+        # long-running service cannot accumulate metadata indefinitely.
+        if len(_CU_SEQLENS_CACHE) >= 256:
+            _CU_SEQLENS_CACHE.clear()
+        _CU_SEQLENS_CACHE[key] = cached
+    return cached
+
+
 @overload
 def sparse_scaled_dot_product_attention(qkv: VarLenTensor) -> VarLenTensor:
     """
@@ -184,9 +206,9 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
             import flash_attn
-        cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
+        cu_seqlens_q = _get_cu_seqlens(q_seqlen, device)
         if num_all_args in [2, 3]:
-            cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
+            cu_seqlens_kv = _get_cu_seqlens(kv_seqlen, device)
         if num_all_args == 1:
             out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max(q_seqlen))
         elif num_all_args == 2:
@@ -196,18 +218,18 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
     elif config.ATTN == 'flash_attn_3':
         if 'flash_attn_3' not in globals():
             import flash_attn_interface as flash_attn_3
-        cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
+        cu_seqlens_q = _get_cu_seqlens(q_seqlen, device)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
             cu_seqlens_kv = cu_seqlens_q.clone()
             max_q_seqlen = max_kv_seqlen = max(q_seqlen)
         elif num_all_args == 2:
             k, v = kv.unbind(dim=1)
-            cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
+            cu_seqlens_kv = _get_cu_seqlens(kv_seqlen, device)
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         elif num_all_args == 3:
-            cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
+            cu_seqlens_kv = _get_cu_seqlens(kv_seqlen, device)
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out = flash_attn_3.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)

@@ -47,8 +47,10 @@ python serve.py --host 0.0.0.0 --port 8000
 | `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; final message carries `glb_base64` |
 
 Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
-`texture_size` (default 4096), `decimation_target` (default 1000000),
-`max_num_tokens` (default 49152), `preprocess_image` (default true).
+`texture_size` (default 2048), `decimation_target` (default 100000),
+`max_num_tokens` (default 49152), and `preprocess_image` (default true).
+Remeshing and source-mesh attribute projection are always enabled because both
+are required for acceptable mesh quality.
 
 ## Client
 
@@ -68,7 +70,7 @@ curl http://localhost:8086/health
 # generate -> save GLB
 curl -X POST http://localhost:8086/generate \
     -F image=@assets/example_image/T.png \
-    -F texture_size=4096 \
+    -F texture_size=2048 \
     -o out.glb
 ```
 
@@ -76,7 +78,8 @@ curl -X POST http://localhost:8086/generate \
 
 Service logs include millisecond timestamps and a short request ID. Each
 generation reports queue wait time and milestone progress from image
-preprocessing through GLB export. Follow them with:
+preprocessing through GLB export, followed by per-stage timings and CUDA peak
+allocated/reserved memory. Follow them with:
 
 ```bash
 docker logs --follow trellis2
