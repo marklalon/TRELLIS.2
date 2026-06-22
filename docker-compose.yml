@@ -13,6 +13,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - OPENCV_IO_ENABLE_OPENEXR=1
       - ATTN_BACKEND=flash-attn
+      - FLEX_GEMM_AUTOTUNE_CACHE_PATH=/models/.cache/flex_gemm/autotune_cache.json
+      - TRITON_CACHE_DIR=/models/.cache/triton
       # Service logs use structured milestones instead of carriage-return bars.
       - TQDM_DISABLE=1
       - HF_HUB_DISABLE_PROGRESS_BARS=1
@@ -26,6 +28,8 @@ services:
       - .:/workspace/TRELLIS.2
       # Mount the pretrained model weights (Docker named volume)
       - models:/models:ro
+      # Persist FlexGEMM autotune results and Triton kernels without making /models writable.
+      - model_cache:/models/.cache
       # Cache HuggingFace downloads (optional but recommended)
       - hf_cache:/workspace/.cache/huggingface
     working_dir: /workspace/TRELLIS.2
@@ -53,5 +57,8 @@ services:
 
 volumes:
   hf_cache:
+  model_cache:
+    name: trellis2_model_cache
+    external: true
   models:
     external: true
