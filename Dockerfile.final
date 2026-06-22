@@ -50,3 +50,11 @@ p = glob.glob('/usr/local/lib/python3.10/dist-packages/cumesh/_cumesh_xatlas*.so
 s = importlib.util.spec_from_file_location('_cumesh_xatlas', p); m = importlib.util.module_from_spec(s); \
 s.loader.exec_module(m); m.Atlas(); print('optimized _cumesh_xatlas loads OK:', p)"; \
     cd / && rm -rf /tmp/xatlas
+
+# Reinstall o-voxel from local source to pick up any local patches
+# (e.g. Morton-order BVH query reordering in postprocess.py).
+# Overwrites the version pre-installed in the base image without
+# recompiling its C extension (--no-deps skips dependency resolution).
+COPY o-voxel /tmp/extensions/o-voxel
+RUN pip install --force-reinstall --no-deps /tmp/extensions/o-voxel --no-build-isolation --no-cache-dir \
+    && rm -rf /tmp/extensions/o-voxel

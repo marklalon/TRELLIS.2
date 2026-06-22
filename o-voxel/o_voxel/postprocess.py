@@ -25,6 +25,34 @@ def _get_rasterize_context() -> "dr.RasterizeCudaContext":
     return _RASTERIZE_CONTEXT
 
 
+def _morton_order(points: torch.Tensor, bits: int = 10) -> torch.Tensor:
+    """Return the permutation that sorts ``points`` along a 3D Z-order (Morton) curve.
+
+    BVH closest-point queries are memory-bound and divergence-bound: threads that
+    query spatially-distant points walk different parts of the tree and thrash the
+    cache. Reordering the query points so that adjacent threads handle spatially
+    close points keeps a warp on coherent subtrees. ``bits`` per axis quantises the
+    points into a 2**bits grid before interleaving (10 bits -> 30-bit code, int64).
+    """
+    pts = points.detach()
+    lo = pts.amin(dim=0)
+    extent = (pts.amax(dim=0) - lo).clamp_min(1e-12)
+    # Quantise each axis to [0, 2**bits - 1].
+    q = ((pts - lo) / extent * (2 ** bits - 1)).clamp_(0, 2 ** bits - 1).to(torch.int64)
+
+    def _part1by2(n: torch.Tensor) -> torch.Tensor:
+        # Spread the low ``bits`` bits of n so each occupies every third bit slot.
+        n = n & 0x3FF
+        n = (n | (n << 16)) & 0x30000FF
+        n = (n | (n << 8)) & 0x300F00F
+        n = (n | (n << 4)) & 0x30C30C3
+        n = (n | (n << 2)) & 0x9249249
+        return n
+
+    code = _part1by2(q[:, 0]) | (_part1by2(q[:, 1]) << 1) | (_part1by2(q[:, 2]) << 2)
+    return torch.argsort(code)
+
+
 def to_glb(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -281,8 +309,19 @@ def to_glb(
     valid_pos = pos[mask]
     
     # Map these positions back to the *original* high-res mesh to get accurate attributes
-    # This corrects geometric errors introduced by simplification/remeshing
-    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+    # This corrects geometric errors introduced by simplification/remeshing.
+    #
+    # The query points are in UV-space raster order, which carries no spatial
+    # coherence in 3D, so neighbouring BVH threads diverge and thrash the cache.
+    # Reorder the queries along a Morton curve, then scatter the results back to
+    # the original order. The closest-point query is independent per point, so the
+    # permutation is exact.
+    order = _morton_order(valid_pos)
+    _, face_id_s, uvw_s = bvh.unsigned_distance(valid_pos[order], return_uvw=True)
+    face_id = torch.empty_like(face_id_s)
+    uvw = torch.empty_like(uvw_s)
+    face_id[order] = face_id_s
+    uvw[order] = uvw_s
     orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
     
@@ -330,7 +369,7 @@ def to_glb(
         mask_inv, 1, cv2.INPAINT_TELEA,
     )
     metallic, roughness, alpha = np.split(pbr, 3, axis=-1)
-    
+
     # Create PBR material
     # Standard PBR packs Metallic and Roughness into Blue and Green channels
     material = trimesh.visual.material.PBRMaterial(
