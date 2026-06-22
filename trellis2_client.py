@@ -149,8 +149,8 @@ def main() -> None:
     parser.add_argument("--ws", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--pipeline-type",
-        default="512",
-        help="512 / 1024 / 1024_cascade / 1536_cascade (default: 512)",
+        default="1024_cascade",
+        help="512 / 1024 / 1024_cascade / 1536_cascade (default: 1024_cascade)",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--texture-size", type=int, default=2048)
