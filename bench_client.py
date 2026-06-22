@@ -28,7 +28,6 @@ import asyncio
 import base64
 import json
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass
@@ -314,7 +313,6 @@ def _find_images(
         print("[error] 未找到任何测试图片!", file=sys.stderr)
         sys.exit(1)
 
-    random.shuffle(images)
     if max_images and len(images) > max_images:
         images = images[:max_images]
 
@@ -385,8 +383,9 @@ async def _run_bench(args) -> None:
         if not result.ok:
             status += f"({result.error[:40]})"
         mb = result.bytes_received / 1024**2
+        fname = os.path.basename(result.image)
         print(f"  [{done_count:>4}/{args.concurrency}] {status:50s}  "
-              f"{result.latency:7.2f}s  {mb:.1f}MB")
+              f"{result.latency:7.2f}s  {mb:.1f}MB  {fname}")
 
     test_elapsed = time.monotonic() - test_start
 

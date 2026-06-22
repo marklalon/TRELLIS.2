@@ -442,17 +442,25 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
             # Serial fallback: keep the sampling lock held through the whole
             # post-processing tail so only one request uses the GPU at a time.
             async with _acquire_or_cancel(state.postprocess_lock, cancellation):
-                return await _to_thread_cancellable(
+                data = await _to_thread_cancellable(
                     _run_postprocess, reporter, mesh, params,
                     cancellation=cancellation,
                 )
+                del mesh
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return data
 
     # Overlap path: the sampling lock is released here; the next request can
     # sample while this one finishes post-processing under its own lock.
     async with _acquire_or_cancel(state.postprocess_lock, cancellation):
-        return await _to_thread_cancellable(
+        data = await _to_thread_cancellable(
             _run_postprocess, reporter, mesh, params, cancellation=cancellation
         )
+        del mesh
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return data
 
 
 def _decode_image(data: bytes) -> Image.Image:
