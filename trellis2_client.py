@@ -72,10 +72,12 @@ async def _run(args) -> None:
         "seed": args.seed,
         "texture_size": args.texture_size,
         "decimation_target": args.decimation_target,
-        "preprocess_image": args.preprocess,
+        "simplify": args.simplify,
+        "texture_sampling_steps": args.texture_sampling_steps,
+        "shape_sampling_steps": args.shape_sampling_steps,
+        "preprocess_image": True,
     }
-    if args.pipeline_type:
-        payload["pipeline_type"] = args.pipeline_type
+    payload["pipeline_type"] = args.pipeline_type
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -136,17 +138,29 @@ def main() -> None:
     parser.add_argument("--ws", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--pipeline-type",
-        default=None,
-        help="512 / 1024 / 1024_cascade / 1536_cascade (default: server's)",
+        default="1024_cascade",
+        help="512 / 1024 / 1024_cascade / 1536_cascade (default: 1024_cascade)",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--decimation-target", type=int, default=100000)
     parser.add_argument(
-        "--preprocess",
-        type=lambda value: value.lower() not in ("0", "false", "no"),
-        default=True,
-        help="Preprocess/remove background (default: true)",
+        "--texture-sampling-steps",
+        type=int,
+        default=12,
+        help="Texture SLat sampling steps (default: 12)",
+    )
+    parser.add_argument(
+        "--shape-sampling-steps",
+        type=int,
+        default=12,
+        help="Shape SLat sampling steps (default: 12)",
+    )
+    parser.add_argument(
+        "--simplify",
+        type=int,
+        default=1000000,
+        help="Mesh simplify target vertex count / nvdiffrast limit (16777216)",
     )
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

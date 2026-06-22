@@ -123,6 +123,7 @@ fi
 if [ "$CUMESH" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
+    sed -i '/torch\.cross(/{/dim=/!s/)$/, dim=-1)/;}' /tmp/extensions/CuMesh/cumesh/remeshing.py
     pip install /tmp/extensions/CuMesh --no-build-isolation
 fi
 
@@ -136,4 +137,11 @@ if [ "$OVOXEL" = true ] ; then
     mkdir -p /tmp/extensions
     cp -r o-voxel /tmp/extensions/o-voxel
     pip install /tmp/extensions/o-voxel --no-build-isolation
+fi
+
+# o-voxel may reinstall its direct CuMesh dependency, so patch the package that
+# is actually present in the active Python environment after all installs.
+if [ "$CUMESH" = true ] || [ "$OVOXEL" = true ] ; then
+    CUMESH_REMESHING=$(python -c "import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec('cumesh').origin).with_name('remeshing.py'))")
+    sed -i '/torch\.cross(/{/dim=/!s/)$/, dim=-1)/;}' "$CUMESH_REMESHING"
 fi

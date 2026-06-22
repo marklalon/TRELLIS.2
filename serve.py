@@ -118,6 +118,8 @@ class GenParams(BaseModel):
     simplify: int = 16777216                     # nvdiffrast vertex limit
     max_num_tokens: int = 49152
     preprocess_image: bool = True
+    texture_sampling_steps: int = 12             # tex SLat sampling steps
+    shape_sampling_steps: int = 12               # shape SLat sampling steps
 
 
 def _load_pipeline():
@@ -203,6 +205,12 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
         preprocess_image=params.preprocess_image,
+        shape_slat_sampler_params={
+            "steps": params.shape_sampling_steps,
+        },
+        tex_slat_sampler_params={
+            "steps": params.texture_sampling_steps,
+        },
         progress_callback=pipeline_progress,
     )[0]
     report(72, "simplifying mesh")
@@ -235,7 +243,11 @@ def _run_generation(image: Image.Image, params: GenParams, request_id: str,
         tmp_path = tmp.name
     try:
         report(95, "exporting GLB")
-        glb.export(tmp_path, extension_webp=False)
+        # WebP texture encoding is markedly faster than PNG's single-threaded
+        # zlib path and produces smaller GLBs. Requires Pillow built with WebP
+        # support (libwebp-dev) and a client/viewer that understands the
+        # EXT_texture_webp glTF extension.
+        glb.export(tmp_path, extension_webp=True)
         with open(tmp_path, "rb") as f:
             data = f.read()
     finally:
@@ -317,6 +329,8 @@ async def generate(
     simplify: int = Form(16777216),
     max_num_tokens: int = Form(49152),
     preprocess_image: bool = Form(True),
+    texture_sampling_steps: int = Form(12),
+    shape_sampling_steps: int = Form(12),
 ):
     """Multipart upload -> binary GLB response."""
     request_id = uuid.uuid4().hex[:8]
@@ -330,6 +344,8 @@ async def generate(
         seed=seed, pipeline_type=pipeline_type, texture_size=texture_size,
         decimation_target=decimation_target, simplify=simplify,
         max_num_tokens=max_num_tokens, preprocess_image=preprocess_image,
+        texture_sampling_steps=texture_sampling_steps,
+        shape_sampling_steps=shape_sampling_steps,
     )
     try:
         image_data = await image.read()

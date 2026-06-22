@@ -11,6 +11,20 @@ import nvdiffrast.torch as dr
 import cumesh
 
 
+# Creating an nvdiffrast CUDA context allocates GPU resources and compiles
+# device programs on first use. The service handles one request at a time
+# (GPU work is serialized), so a single context can be reused across requests
+# instead of being rebuilt inside every to_glb call.
+_RASTERIZE_CONTEXT = None
+
+
+def _get_rasterize_context() -> "dr.RasterizeCudaContext":
+    global _RASTERIZE_CONTEXT
+    if _RASTERIZE_CONTEXT is None:
+        _RASTERIZE_CONTEXT = dr.RasterizeCudaContext()
+    return _RASTERIZE_CONTEXT
+
+
 def to_glb(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -40,7 +54,7 @@ def to_glb(
     Args:
         vertices: (N, 3) tensor of vertex positions
         faces: (M, 3) tensor of vertex indices
-        attr_volume: (L, C) features of a sprase tensor for attribute interpolation
+        attr_volume: (L, C) features of a sparse tensor for attribute interpolation
         coords: (L, 3) tensor of coordinates for each voxel
         attr_layout: dictionary of slice objects for each attribute
         aabb: (2, 3) tensor of minimum and maximum coordinates of the volume
@@ -243,8 +257,8 @@ def to_glb(
         print("Sampling attributes...", end='', flush=True)
         
     report(75, "sampling texture attributes")
-    # Setup differentiable rasterizer context
-    ctx = dr.RasterizeCudaContext()
+    # Reuse the cached differentiable rasterizer context across requests.
+    ctx = _get_rasterize_context()
     # Prepare UV coordinates for rasterization (rendering in UV space)
     uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
     rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
@@ -296,10 +310,12 @@ def to_glb(
     report(92, "finalizing textures and material")
     mask = mask.cpu().numpy()
 
-    # Transfer the attribute texture once instead of issuing four sequential
-    # GPU->CPU copies. OpenCV supports three-channel inpainting, so the scalar
-    # PBR channels can also be filled together in one pass.
-    attrs_np = np.clip(attrs.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    # Scale, clamp, and cast to uint8 on the GPU before the single GPU->CPU
+    # copy. This moves the per-texel arithmetic onto the GPU and transfers a
+    # quarter of the bytes (uint8 instead of float32). OpenCV supports
+    # three-channel inpainting, so the scalar PBR channels can also be filled
+    # together in one pass.
+    attrs_np = (attrs * 255).clamp_(0, 255).to(torch.uint8).cpu().numpy()
     base_color = attrs_np[..., attr_layout['base_color']]
     metallic = attrs_np[..., attr_layout['metallic']]
     roughness = attrs_np[..., attr_layout['roughness']]

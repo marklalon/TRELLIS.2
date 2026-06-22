@@ -4,5 +4,20 @@ ARG BASE_IMAGE=trellis2:base
 FROM ${BASE_IMAGE}
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata && \
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata libwebp-dev && \
     rm -rf /var/lib/apt/lists/*
+
+# Rebuild pillow-simd from source now that libwebp-dev is present, so GLB
+# textures can be exported as WebP (markedly faster than PNG's single-threaded
+# zlib path, and smaller output). pillow-simd ships only as an sdist, so this
+# recompiles the same SIMD-accelerated build with WebP support added. Kept in
+# the cheap final layer to avoid rebuilding the expensive base image. The check
+# fails the build early if WebP support is still missing.
+RUN pip install --no-cache-dir --force-reinstall pillow-simd \
+    && python -c "from PIL import features; assert features.check('webp'), 'Pillow built without WebP support'"
+
+# CuMesh's pinned remesher relies on torch.cross's deprecated implicit
+# dimension. Patch already-built base images here as well, without rebuilding
+# the expensive CUDA extension layers.
+RUN sed -i '/torch\.cross(/{/dim=/!s/)$/, dim=-1)/;}' \
+        /usr/local/lib/python3.10/dist-packages/cumesh/remeshing.py
