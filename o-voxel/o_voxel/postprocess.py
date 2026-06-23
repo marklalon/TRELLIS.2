@@ -74,6 +74,7 @@ def to_glb(
     mesh_cluster_refine_iterations=0,
     mesh_cluster_global_iterations=1,
     mesh_cluster_smooth_strength=1,
+    alpha_mode: str = 'OPAQUE',
     verbose: bool = False,
     use_tqdm: bool = False,
     progress_callback: Optional[Callable[[int, str], None]] = None,
@@ -100,6 +101,7 @@ def to_glb(
         mesh_cluster_refine_iterations: number of iterations for refining clusters in uv unwrapping
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
         mesh_cluster_smooth_strength: strength of smoothing for clustering in uv unwrapping
+        alpha_mode: glTF alpha mode - 'OPAQUE', 'MASK', or 'BLEND'
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
         progress_callback: optional ``(percent, stage)`` progress callback
@@ -345,7 +347,6 @@ def to_glb(
     # copy. This moves the per-texel arithmetic onto the GPU and transfers a
     # quarter of the bytes (uint8 instead of float32).
     attrs_np = (attrs * 255).clamp_(0, 255).to(torch.uint8).cpu().numpy()
-    alpha_mode = 'OPAQUE'
 
     # Pad gaps to prevent black seams at UV boundaries. Pack the scalar PBR
     # channels together so they share a single fill pass.

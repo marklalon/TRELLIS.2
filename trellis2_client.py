@@ -76,6 +76,7 @@ async def _run(args) -> None:
         "simplify": args.simplify,
         "texture_sampling_steps": args.texture_sampling_steps,
         "shape_sampling_steps": args.shape_sampling_steps,
+        "alpha_mode": args.alpha_mode,
         "preprocess_image": True,
     }
     payload["pipeline_type"] = args.pipeline_type
@@ -172,6 +173,13 @@ def main() -> None:
         type=int,
         default=1000000,
         help="Mesh simplify target vertex count / nvdiffrast limit (16777216)",
+    )
+    parser.add_argument(
+        "--alpha-mode",
+        type=str,
+        default='OPAQUE',
+        choices=['OPAQUE', 'MASK', 'BLEND'],
+        help="Alpha mode for PBR material (default: OPAQUE)",
     )
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

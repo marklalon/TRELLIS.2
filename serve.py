@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
-from typing import Callable, Optional, TypeVar
+from typing import Callable, Literal, Optional, TypeVar
 
 LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -247,6 +247,7 @@ class GenParams(BaseModel):
     preprocess_image: bool = True
     texture_sampling_steps: int = 12             # tex SLat sampling steps
     shape_sampling_steps: int = 12               # shape SLat sampling steps
+    alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
 
 
 def _load_pipeline():
@@ -419,6 +420,7 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=params.decimation_target,
         texture_size=params.texture_size,
+        alpha_mode=params.alpha_mode,
         remesh=True,
         remesh_band=1,
         remesh_project=0,
@@ -593,6 +595,7 @@ async def generate(
     preprocess_image: bool = Form(True),
     texture_sampling_steps: int = Form(12),
     shape_sampling_steps: int = Form(12),
+    alpha_mode: str = Form('OPAQUE'),
 ):
     """Multipart upload -> binary GLB response."""
     request_id = uuid.uuid4().hex[:8]
@@ -608,6 +611,7 @@ async def generate(
         max_num_tokens=max_num_tokens, preprocess_image=preprocess_image,
         texture_sampling_steps=texture_sampling_steps,
         shape_sampling_steps=shape_sampling_steps,
+        alpha_mode=alpha_mode,
     )
     try:
         image_data = await image.read()
