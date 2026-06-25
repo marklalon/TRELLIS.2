@@ -4,7 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: trellis2:cu128-torch2.7.1
-    container_name: trellis2
+    container_name: trellis2    
+    restart: unless-stopped
     runtime: nvidia
     environment:
       - TZ=Asia/Shanghai
