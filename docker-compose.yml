@@ -2,10 +2,8 @@ services:
   trellis2:
     build:
       context: .
-      dockerfile: Dockerfile.final
-      args:
-        BASE_IMAGE: trellis2:base
-    image: trellis2:final
+      dockerfile: Dockerfile
+    image: trellis2:cu128-torch2.7.1
     container_name: trellis2
     runtime: nvidia
     environment:
