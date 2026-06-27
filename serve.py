@@ -45,8 +45,8 @@ logger.info("Startup progress: importing runtime dependencies")
 _runtime_import_started = time.monotonic()
 import torch
 from PIL import Image
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
             time.monotonic() - _runtime_import_started)
@@ -504,16 +504,6 @@ def _decode_image(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
-async def _watch_http_disconnect(
-    request: Request, cancellation: _CancellationToken
-) -> None:
-    while not cancellation.cancelled:
-        if await request.is_disconnected():
-            cancellation.cancel("HTTP client disconnected")
-            return
-        await asyncio.sleep(0.25)
-
-
 async def _watch_ws_cancellation(
     ws: WebSocket, cancellation: _CancellationToken, request_id: str
 ) -> bool:
@@ -566,87 +556,6 @@ async def health():
     if not state.ready:
         return JSONResponse({"status": "loading"}, status_code=503)
     return {"status": "ok", "busy": state.busy}
-
-
-@app.get("/info")
-async def info():
-    return {
-        "model_path": MODEL_PATH,
-        "rembg_model_path": REMBG_MODEL_PATH,
-        "ready": state.ready,
-        "busy": state.busy,
-        "rembg_warmup_status": state.rembg_warmup_status,
-        "default_pipeline_type": DEFAULT_PIPELINE,
-        "loaded_at": state.loaded_at,
-        "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-    }
-
-
-@app.post("/generate")
-async def generate(
-    request: Request,
-    image: UploadFile = File(..., description="Input image (png/jpg/webp)"),
-    seed: int = Form(42),
-    pipeline_type: Optional[str] = Form(None),
-    texture_size: int = Form(2048),
-    decimation_target: int = Form(100000),
-    simplify: int = Form(16777216),
-    max_num_tokens: int = Form(49152),
-    preprocess_image: bool = Form(True),
-    texture_sampling_steps: int = Form(12),
-    shape_sampling_steps: int = Form(12),
-    alpha_mode: str = Form('OPAQUE'),
-):
-    """Multipart upload -> binary GLB response."""
-    request_id = uuid.uuid4().hex[:8]
-    received_at = time.monotonic()
-    logger.info("[%s] HTTP request received filename=%r content_type=%r",
-                request_id, image.filename, image.content_type)
-    if not state.ready:
-        logger.warning("[%s] rejected: model still loading", request_id)
-        return JSONResponse({"error": "model still loading"}, status_code=503)
-    params = GenParams(
-        seed=seed, pipeline_type=pipeline_type, texture_size=texture_size,
-        decimation_target=decimation_target, simplify=simplify,
-        max_num_tokens=max_num_tokens, preprocess_image=preprocess_image,
-        texture_sampling_steps=texture_sampling_steps,
-        shape_sampling_steps=shape_sampling_steps,
-        alpha_mode=alpha_mode,
-    )
-    try:
-        image_data = await image.read()
-        img = _decode_image(image_data)
-        logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s params=%s",
-                    request_id, len(image_data), img.width, img.height, img.mode,
-                    params.model_dump())
-    except Exception as e:
-        logger.warning("[%s] invalid image: %s", request_id, e)
-        return JSONResponse({"error": f"invalid image: {e}"}, status_code=400)
-    cancellation = _CancellationToken()
-    disconnect_watcher = asyncio.create_task(
-        _watch_http_disconnect(request, cancellation)
-    )
-    try:
-        glb = await _generate(
-            img, params, request_id, cancellation=cancellation
-        )
-    except GenerationCancelled as e:
-        logger.info("[%s] HTTP generation cancelled: %s", request_id, e)
-        return JSONResponse({"error": str(e), "request_id": request_id}, status_code=499)
-    except Exception as e:
-        logger.exception("[%s] generation failed", request_id)
-        return JSONResponse({"error": str(e)}, status_code=500)
-    finally:
-        disconnect_watcher.cancel()
-        with suppress(asyncio.CancelledError):
-            await disconnect_watcher
-    logger.info("[%s] HTTP request completed status=200 bytes=%d elapsed=%.2fs",
-                request_id, len(glb), time.monotonic() - received_at)
-    return Response(
-        content=glb,
-        media_type="model/gltf-binary",
-        headers={"Content-Disposition": 'attachment; filename="output.glb"'},
-    )
 
 
 @app.websocket("/ws/generate")
