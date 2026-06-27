@@ -9,7 +9,6 @@ Requires the ``websockets`` package.
 """
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -66,10 +65,9 @@ async def _run(args) -> None:
 
     ws_url = _websocket_url(args.server)
     with open(args.image, "rb") as f:
-        image_b64 = base64.b64encode(f.read()).decode("ascii")
+        image_bytes = f.read()
 
     payload = {
-        "image_base64": image_b64,
         "seed": args.seed,
         "texture_size": args.texture_size,
         "decimation_target": args.decimation_target,
@@ -91,6 +89,7 @@ async def _run(args) -> None:
             open_timeout=args.timeout,
         ) as ws:
             await ws.send(json.dumps(payload))
+            await ws.send(image_bytes)
 
             try:
                 async for raw_message in ws:
@@ -111,7 +110,7 @@ async def _run(args) -> None:
                     elif stage == "done":
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
-                        glb = base64.b64decode(message["glb_base64"])
+                        glb = await ws.recv()
                         output_dir = os.path.dirname(os.path.abspath(args.output))
                         os.makedirs(output_dir, exist_ok=True)
                         with open(args.output, "wb") as f:

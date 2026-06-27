@@ -25,7 +25,6 @@
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -142,8 +141,8 @@ async def _ws_request(
         t0 = time.monotonic()
         ws_url = _ws_url(server)
         with open(image_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("ascii")
-        payload = {"image_base64": image_b64, **params}
+            image_bytes = f.read()
+        payload = {**params}
 
         try:
             async with websockets.connect(
@@ -152,6 +151,7 @@ async def _ws_request(
                 open_timeout=timeout,
             ) as ws:
                 await ws.send(json.dumps(payload))
+                await ws.send(image_bytes)
                 progress_count = 0
                 try:
                     async for raw in ws:
@@ -163,7 +163,7 @@ async def _ws_request(
                             progress_count += 1
                             continue
                         elif stage == "done":
-                            glb_bytes = base64.b64decode(msg["glb_base64"])
+                            glb_bytes = await ws.recv()
                             elapsed = time.monotonic() - t0
                             return RequestResult(
                                 ok=True, protocol="ws", image=image_path,

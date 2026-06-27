@@ -20,9 +20,9 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import argparse
 import asyncio
-import base64
 import importlib
 import io
+import json
 import logging
 import tempfile
 import threading
@@ -562,10 +562,12 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     Protocol:
-      client -> {"image_base64": "...", ...params}
-      client -> {"type": "cancel"}  (while generation is running)
+      client -> {"seed": 42, ...params}        (JSON text frame)
+      client -> <raw image bytes>               (binary frame)
+      client -> {"type": "cancel"}               (while generation is running)
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
-      final  -> {"stage": "done", "glb_base64": "..."}
+      server -> {"stage": "done", "glb_size": N, ...}  (JSON text frame)
+      server -> <raw GLB bytes>                 (binary frame)
     """
     request_id = uuid.uuid4().hex[:8]
     cancellation = None
@@ -574,7 +576,8 @@ async def ws_generate(ws: WebSocket):
     await ws.accept()
     logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
     try:
-        req = await ws.receive_json()
+        raw = await ws.receive_text()
+        req = json.loads(raw)
         logger.info("[%s] WebSocket generation request received", request_id)
         if not state.ready:
             logger.warning("[%s] rejected: model still loading", request_id)
@@ -582,7 +585,7 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
         try:
-            image_data = base64.b64decode(req.pop("image_base64"), validate=True)
+            image_data = await ws.receive_bytes()
             img = _decode_image(image_data)
         except Exception as e:
             logger.warning("[%s] invalid image: %s", request_id, e)
@@ -662,8 +665,9 @@ async def ws_generate(ws: WebSocket):
             "elapsed_sec": round(time.time() - t0, 2),
             "progress": 100,
             "request_id": request_id,
-            "glb_base64": base64.b64encode(glb).decode("ascii"),
+            "glb_size": len(glb),
         })
+        await ws.send_bytes(glb)
         logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs",
                     request_id, len(glb), time.time() - t0)
         await ws.close()

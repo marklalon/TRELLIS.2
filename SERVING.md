@@ -44,7 +44,7 @@ python serve.py --host 0.0.0.0 --port 8000
 | `GET` | `/health` | `200 {"status":"ok"}` when ready, `503` while loading |
 | `GET` | `/info` | Model path, device, busy state |
 | `POST` | `/generate` | multipart `image` upload → binary GLB |
-| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; supports cancellation; final message carries `glb_base64` |
+| `WS` | `/ws/generate` | streams `queued`/`processing`/`done` JSON with `progress` and `step`; supports cancellation; final message carries `glb_size` (JSON text frame) followed by raw GLB bytes (binary frame) |
 
 Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
 `texture_size` (default 2048), `decimation_target` (default 100000),
