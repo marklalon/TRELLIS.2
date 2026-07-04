@@ -23,6 +23,7 @@ services:
       - TRELLIS2_REMBG_MODEL_PATH=/models/briaai/RMBG-1.4
       - TRELLIS2_PORT=8000
       - TRELLIS2_PIPELINE=512
+      - TRELLIS2_LOAD_WORKERS=1
     volumes:
       # Mount the project source code (read-write for development)
       - .:/workspace/TRELLIS.2

@@ -69,8 +69,52 @@ STARTUP_HEARTBEAT_SEC = max(
 # sampling. Set to 0 to fall back to fully serial generation (e.g. if VRAM is
 # too tight to keep one finished mesh resident while another request samples).
 OVERLAP_POSTPROCESS = os.environ.get("TRELLIS2_OVERLAP_POSTPROCESS", "1") == "1"
+# After the pipeline is resident in VRAM, reclaim the transient host memory the
+# load leaves behind. Two independent knobs:
+#   TRELLIS2_TRIM_MEMORY (default on): gc + empty_cache + glibc malloc_trim, to
+#     return the freed CPU allocator arenas (transient per-model CPU construction
+#     from load_state_dict(assign=True)) back to the OS. Safe and cheap.
+#   TRELLIS2_DROP_PAGE_CACHE (default on): drop the page cache filled by reading
+#     the ~20GB of weight files. This is the big reclaim on WSL2, where the page
+#     cache otherwise stays pinned inside the VM. Needs root (the container is)
+#     and only touches clean cache, but forces a re-read on first cold access, so
+#     set it to 0 if you would rather keep the weights hot in cache.
+TRIM_MEMORY = os.environ.get("TRELLIS2_TRIM_MEMORY", "1") == "1"
+DROP_PAGE_CACHE = os.environ.get("TRELLIS2_DROP_PAGE_CACHE", "1") == "1"
 o_voxel = None
 T = TypeVar("T")
+
+
+def _trim_host_memory() -> None:
+    """Return transient host RAM used during model loading back to the OS.
+
+    The weights are resident in VRAM by this point; the host-side leftovers are
+    (1) freed CPU tensors from the per-model construction that glibc keeps in its
+    arenas, and (2) the page cache from reading the weight files. Neither is
+    needed for inference, but on WSL2 both keep the VM's memory footprint high
+    because the VM does not proactively hand reclaimable memory back to Windows.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    # glibc retains freed heap in per-arena free lists by default; malloc_trim
+    # releases the top of each arena back to the kernel.
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+    if DROP_PAGE_CACHE:
+        # Drop only clean page cache (mode "1"): the weight-file bytes read during
+        # load. Dirty pages are untouched, so this cannot lose data.
+        try:
+            with open("/proc/sys/vm/drop_caches", "w") as f:
+                f.write("1")
+        except OSError as e:
+            logger.info("Skipping page-cache drop (need root / procfs): %s", e)
 
 
 def _run_startup_stage(label: str, operation: Callable[[], T]) -> T:
@@ -301,6 +345,8 @@ def _load_pipeline():
     state.loaded_at = time.time()
     logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
                 DEFAULT_PIPELINE)
+    if TRIM_MEMORY:
+        _run_startup_stage("releasing transient host memory", _trim_host_memory)
 
 
 async def _background_rembg_warmup() -> None:
