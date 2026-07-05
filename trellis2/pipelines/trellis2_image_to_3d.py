@@ -1,5 +1,7 @@
 from typing import *
 import os
+import logging
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 import numpy as np
@@ -71,6 +73,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         rembg_model: Callable = None,
         default_pipeline_type: str = '512',
     ):
+        # Sequential CPU offload: the 1.3B flow models are idle during the VRAM
+        # peak (the VAE decoders), so with offload on they live on the CPU and are
+        # paged to the GPU only for their own sampling stage. This drops the
+        # 1024_cascade peak from ~20.7GB to ~10-11GB, fitting 16GB cards. Off by
+        # default; enable with TRELLIS2_OFFLOAD=1.
+        self._offload = os.environ.get("TRELLIS2_OFFLOAD", "0") == "1"
         if models is None:
             return
         super().__init__(models)
@@ -163,6 +171,41 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if self.rembg_model is not None:
             self.rembg_model.to(device)
 
+    @staticmethod
+    def _is_offloadable(model_key: str) -> bool:
+        """The big flow DiTs are used one stage at a time and sit idle during the
+        peak-VRAM decode, so they are the ones we page to CPU."""
+        return 'flow' in model_key
+
+    def cuda(self) -> None:
+        super().cuda()
+        if self._offload:
+            # Keep the flow models on the CPU; decoders / image encoder stay resident.
+            offloaded = []
+            for key, model in self.models.items():
+                if self._is_offloadable(key) and isinstance(model, nn.Module):
+                    model.cpu()
+                    offloaded.append(key)
+            torch.cuda.empty_cache()
+            logging.getLogger("trellis2.pipeline").info(
+                "CPU offload enabled: flow models kept on CPU until sampling (%s)",
+                ", ".join(offloaded),
+            )
+
+    @contextmanager
+    def _resident(self, model):
+        """Page a flow model onto the GPU for the duration of its sampling stage,
+        then evict it back to the CPU. A no-op unless offload is enabled."""
+        if not self._offload or not isinstance(model, nn.Module):
+            yield model
+            return
+        model.to(self._device)
+        try:
+            yield model
+        finally:
+            model.cpu()
+            torch.cuda.empty_cache()
+
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
         Preprocess the input image.
@@ -238,14 +281,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         in_channels = flow_model.in_channels
         noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
-        z_s = self.sparse_structure_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=False,
-            tqdm_desc="Sampling sparse structure",
-        ).samples
+        with self._resident(flow_model):
+            z_s = self.sparse_structure_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=False,
+                tqdm_desc="Sampling sparse structure",
+            ).samples
 
         # Decode sparse structure latent
         decoder = self.models['sparse_structure_decoder']
@@ -278,14 +322,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
-        slat = self.shape_slat_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=False,
-            tqdm_desc="Sampling shape SLat",
-        ).samples
+        with self._resident(flow_model):
+            slat = self.shape_slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=False,
+                tqdm_desc="Sampling shape SLat",
+            ).samples
 
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
@@ -319,14 +364,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
-        slat = self.shape_slat_sampler.sample(
-            flow_model_lr,
-            noise,
-            **lr_cond,
-            **sampler_params,
-            verbose=False,
-            tqdm_desc="Sampling shape SLat",
-        ).samples
+        with self._resident(flow_model_lr):
+            slat = self.shape_slat_sampler.sample(
+                flow_model_lr,
+                noise,
+                **lr_cond,
+                **sampler_params,
+                verbose=False,
+                tqdm_desc="Sampling shape SLat",
+            ).samples
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
@@ -353,14 +399,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
-        slat = self.shape_slat_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=False,
-            tqdm_desc="Sampling shape SLat",
-        ).samples
+        with self._resident(flow_model):
+            slat = self.shape_slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=False,
+                tqdm_desc="Sampling shape SLat",
+            ).samples
 
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
@@ -410,15 +457,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         in_channels = flow_model.in_channels if isinstance(flow_model, nn.Module) else flow_model[0].in_channels
         noise = shape_slat.replace(feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device))
         sampler_params = {**self.tex_slat_sampler_params, **sampler_params}
-        slat = self.tex_slat_sampler.sample(
-            flow_model,
-            noise,
-            concat_cond=shape_slat,
-            **cond,
-            **sampler_params,
-            verbose=False,
-            tqdm_desc="Sampling texture SLat",
-        ).samples
+        with self._resident(flow_model):
+            slat = self.tex_slat_sampler.sample(
+                flow_model,
+                noise,
+                concat_cond=shape_slat,
+                **cond,
+                **sampler_params,
+                verbose=False,
+                tqdm_desc="Sampling texture SLat",
+            ).samples
 
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)

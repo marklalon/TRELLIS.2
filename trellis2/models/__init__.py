@@ -129,6 +129,15 @@ def from_pretrained(path: str, device=None, **kwargs):
     with skip_random_init():
         model = __getattr__(config['name'])(**config['args'], **kwargs)
 
+    # Self-describing quantized checkpoints (written by the offline quantizer)
+    # carry a top-level "quantization" block. Rebuild the matching quantized
+    # module structure before load so the int8/scale buffers line up. Absent this
+    # key the checkpoint is plain bf16/fp16 and loads unchanged.
+    quant_cfg = config.get('quantization')
+    if quant_cfg:
+        from .. import quant_int8
+        quant_int8.apply_quantization_from_config(model, quant_cfg)
+
     load_device = str(device) if device is not None else "cpu"
     state_dict = load_file(model_file, device=load_device)
     if device is not None:

@@ -19,11 +19,20 @@ services:
       - HF_HUB_DISABLE_PROGRESS_BARS=1
       - HF_HOME=/workspace/.cache/huggingface
       # Service-mode settings (used by `serve`)
-      - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
+      # Point at the INT8-MLP directory (produced by quantize_offline_int8_mlp.py)
+      # to serve quantized weights; the loader auto-detects quantized vs original
+      # per checkpoint, so no other flag is needed:
+      - TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B-INT8-MLP
+      #- TRELLIS2_MODEL_PATH=/models/microsoft/TRELLIS.2-4B
       - TRELLIS2_REMBG_MODEL_PATH=/models/briaai/RMBG-1.4
       - TRELLIS2_PORT=8000
-      - TRELLIS2_PIPELINE=512
+      - TRELLIS2_PIPELINE=1024_cascade
       - TRELLIS2_LOAD_WORKERS=1
+      # Sequential CPU offload of the flow DiTs. Set to 1 on <=16GB GPUs: it pages
+      # each 1.3B flow model to the GPU only for its sampling stage, dropping the
+      # 1024_cascade peak from ~20.7GB to ~10-11GB (adds a few seconds/request of
+      # PCIe transfer). Leave 0 on large-VRAM cards.
+      - TRELLIS2_OFFLOAD=0
     volumes:
       # Mount the project source code (read-write for development)
       - .:/workspace/TRELLIS.2
