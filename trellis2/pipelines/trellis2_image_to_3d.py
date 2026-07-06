@@ -13,6 +13,37 @@ from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
 
 
+logger = logging.getLogger("trellis2.pipeline")
+# serve.py configures logging only on its own "trellis2.serve" logger and never
+# touches the root logger, so this logger would otherwise inherit root's WARNING
+# level with no handler and drop every INFO line. Make it self-sufficient.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def _log_decode_peak(tag: str) -> None:
+    """Attribute the decode-stage activation peak to a sub-op.
+
+    ``max_memory_allocated`` captures the torch-side transient peak of a UNet
+    forward even though ``no_grad`` frees it immediately -- which boundary and
+    background probes both miss. Gated by the shared OVOXEL_VRAM_LOG switch.
+    """
+    if os.environ.get("OVOXEL_VRAM_LOG", "1") == "0" or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    logger.info("[decode] %-12s peak_alloc=%.2fG now_alloc=%.2fG", tag,
+                torch.cuda.max_memory_allocated() / 1e9,
+                torch.cuda.memory_allocated() / 1e9)
+    torch.cuda.reset_peak_memory_stats()
+
+
 def _resolve_model_names_to_local(args: dict) -> None:
     """
     Replace HF model names (e.g. ``facebook/dinov3-vitl16-pretrain-lvd1689m``)
@@ -73,12 +104,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         rembg_model: Callable = None,
         default_pipeline_type: str = '512',
     ):
-        # Sequential CPU offload: the 1.3B flow models are idle during the VRAM
-        # peak (the VAE decoders), so with offload on they live on the CPU and are
-        # paged to the GPU only for their own sampling stage. This drops the
-        # 1024_cascade peak from ~20.7GB to ~10-11GB, fitting 16GB cards. Off by
-        # default; enable with TRELLIS2_OFFLOAD=1.
-        self._offload = os.environ.get("TRELLIS2_OFFLOAD", "0") == "1"
+        # CPU offload of the idle 1.3B flow models, which are dead weight during
+        # the VRAM peak (the VAE decoders). TRELLIS2_OFFLOAD selects the policy:
+        #   "0"   (default) - no offload, flow models always resident.
+        #   "1"/"stage"     - page each flow model in for its own sampling stage
+        #                     and out immediately after. Lowest resident VRAM but
+        #                     stalls every stage (6 transfers/request).
+        #   "decode"        - keep flow models resident through all sampling
+        #                     stages (fast, no per-stage stalls), then evict them
+        #                     once before decode so decode+postprocess run without
+        #                     them. Restored lazily on the next request's
+        #                     sampling. ~4 transfers/request.
+        _mode = os.environ.get("TRELLIS2_OFFLOAD", "0").strip().lower()
+        if _mode in ("1", "true", "stage"):
+            self._offload_mode = "stage"
+        elif _mode == "decode":
+            self._offload_mode = "decode"
+        else:
+            self._offload_mode = None
+        self._offload = self._offload_mode is not None
         if models is None:
             return
         super().__init__(models)
@@ -180,22 +224,28 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     def cuda(self) -> None:
         super().cuda()
         if self._offload:
-            # Keep the flow models on the CPU; decoders / image encoder stay resident.
+            # Start the flow models on the CPU; _resident pages them in on demand.
+            # decoders / image encoder stay resident.
             offloaded = []
             for key, model in self.models.items():
                 if self._is_offloadable(key) and isinstance(model, nn.Module):
                     model.cpu()
                     offloaded.append(key)
             torch.cuda.empty_cache()
-            logging.getLogger("trellis2.pipeline").info(
-                "CPU offload enabled: flow models kept on CPU until sampling (%s)",
-                ", ".join(offloaded),
+            logger.info(
+                "CPU offload=%s: flow models start on CPU (%s)",
+                self._offload_mode, ", ".join(offloaded),
             )
 
     @contextmanager
     def _resident(self, model):
-        """Page a flow model onto the GPU for the duration of its sampling stage,
-        then evict it back to the CPU. A no-op unless offload is enabled."""
+        """Ensure a flow model is on the GPU for its sampling stage.
+
+        In "stage" mode it is evicted back to the CPU immediately after (lowest
+        VRAM, but a transfer every stage). In "decode" mode it is left resident
+        so sampling never stalls; the bulk eviction happens once in
+        ``_evict_flow_models`` before decode. A no-op unless offload is enabled.
+        """
         if not self._offload or not isinstance(model, nn.Module):
             yield model
             return
@@ -203,8 +253,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         try:
             yield model
         finally:
-            model.cpu()
+            if self._offload_mode == "stage":
+                model.cpu()
+                torch.cuda.empty_cache()
+
+    def _evict_flow_models(self) -> None:
+        """Page any resident flow model back to the CPU. Used before decode in
+        "decode" mode; a no-op in "stage" mode (already evicted) and when off."""
+        if not self._offload:
+            return
+        moved = []
+        for key, model in self.models.items():
+            if (self._is_offloadable(key) and isinstance(model, nn.Module)
+                    and next(model.parameters()).device.type != 'cpu'):
+                model.cpu()
+                moved.append(key)
+        if moved:
             torch.cuda.empty_cache()
+            logger.info("evicted flow models to CPU before decode (%s)",
+                        ", ".join(moved))
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -506,8 +573,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
         """
+        _log_decode_peak("before")
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        _log_decode_peak("shape_slat")
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
+        _log_decode_peak("tex_slat")
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
             m.fill_holes()
@@ -641,6 +711,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
+        self._evict_flow_models()
         torch.cuda.empty_cache()
         report(85, "decoding mesh and texture")
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)

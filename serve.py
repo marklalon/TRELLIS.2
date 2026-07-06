@@ -495,6 +495,59 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
     return data
 
 
+class _VramPeakMonitor:
+    """Background sampler that logs each new VRAM high-water mark.
+
+    Boundary probes miss a transient that is allocated *and* freed inside
+    un-instrumented code (e.g. the pipeline decode). This polls the driver
+    (``mem_get_info``, so it sees every allocator including raw cudaMalloc) on a
+    fixed interval and logs whenever usage climbs by ``step_gb``. Correlate the
+    log *timestamp* with the progress-stage logs to pin the peak to a stage.
+    Gated by the shared OVOXEL_VRAM_LOG switch (set to 0 to disable).
+    """
+
+    def __init__(self, request_id: str, interval: float = 0.05,
+                 step_gb: float = 0.5):
+        self._request_id = request_id
+        self._interval = interval
+        self._step = step_gb
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._device = 0
+        self.peak_gb = 0.0
+
+    def _run(self) -> None:
+        last_logged = 0.0
+        while not self._stop.is_set():
+            try:
+                free, total = torch.cuda.mem_get_info(self._device)
+            except Exception:
+                break
+            used = (total - free) / 1e9
+            if used > self.peak_gb:
+                self.peak_gb = used
+            if used >= last_logged + self._step:
+                last_logged = used
+                logger.info("[%s] vram high-water: %.2fG", self._request_id, used)
+            self._stop.wait(self._interval)
+
+    def __enter__(self) -> "_VramPeakMonitor":
+        if (os.environ.get("OVOXEL_VRAM_LOG", "1") != "0"
+                and torch.cuda.is_available()):
+            self._device = torch.cuda.current_device()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            logger.info("[%s] vram peak this request: %.2fG",
+                        self._request_id, self.peak_gb)
+        return False
+
+
 async def _generate(image: Image.Image, params: GenParams, request_id: str,
                     progress_callback=None,
                     cancellation: Optional[_CancellationToken] = None) -> bytes:
@@ -508,42 +561,43 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
     cancellation = cancellation or _CancellationToken()
     reporter = _ProgressReporter(request_id, cancellation, progress_callback)
 
-    queued = state.sampling_lock.locked()
-    logger.info("[%s] queued=%s", request_id, queued)
-    wait_started = time.monotonic()
-    async with _acquire_or_cancel(state.sampling_lock, cancellation):
-        state.busy = True
-        logger.info("[%s] sampling lock acquired after %.2fs", request_id,
-                    time.monotonic() - wait_started)
-        try:
-            mesh = await _to_thread_cancellable(
-                _run_sampling, reporter, image, params, cancellation=cancellation
-            )
-        finally:
-            state.busy = False
-        if not OVERLAP_POSTPROCESS:
-            # Serial fallback: keep the sampling lock held through the whole
-            # post-processing tail so only one request uses the GPU at a time.
-            async with _acquire_or_cancel(state.postprocess_lock, cancellation):
-                data = await _to_thread_cancellable(
-                    _run_postprocess, reporter, mesh, params,
-                    cancellation=cancellation,
+    with _VramPeakMonitor(request_id):
+        queued = state.sampling_lock.locked()
+        logger.info("[%s] queued=%s", request_id, queued)
+        wait_started = time.monotonic()
+        async with _acquire_or_cancel(state.sampling_lock, cancellation):
+            state.busy = True
+            logger.info("[%s] sampling lock acquired after %.2fs", request_id,
+                        time.monotonic() - wait_started)
+            try:
+                mesh = await _to_thread_cancellable(
+                    _run_sampling, reporter, image, params, cancellation=cancellation
                 )
-                del mesh
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                return data
+            finally:
+                state.busy = False
+            if not OVERLAP_POSTPROCESS:
+                # Serial fallback: keep the sampling lock held through the whole
+                # post-processing tail so only one request uses the GPU at a time.
+                async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+                    data = await _to_thread_cancellable(
+                        _run_postprocess, reporter, mesh, params,
+                        cancellation=cancellation,
+                    )
+                    del mesh
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return data
 
-    # Overlap path: the sampling lock is released here; the next request can
-    # sample while this one finishes post-processing under its own lock.
-    async with _acquire_or_cancel(state.postprocess_lock, cancellation):
-        data = await _to_thread_cancellable(
-            _run_postprocess, reporter, mesh, params, cancellation=cancellation
-        )
-        del mesh
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return data
+        # Overlap path: the sampling lock is released here; the next request can
+        # sample while this one finishes post-processing under its own lock.
+        async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+            data = await _to_thread_cancellable(
+                _run_postprocess, reporter, mesh, params, cancellation=cancellation
+            )
+            del mesh
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return data
 
 
 def _decode_image(data: bytes) -> Image.Image:

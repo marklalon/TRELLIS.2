@@ -46,8 +46,8 @@ if /i "%CMD%"=="down" (
 
 rem -- Explicit rebuild: rebuild the image and replace the container.
 if defined REBUILD (
-    echo Rebuilding image ^(--no-cache^) ...
-    docker compose build --no-cache
+    echo Rebuilding image ...
+    docker compose build
     if errorlevel 1 goto :build_failed
 
     echo Recreating and starting services in the background...
@@ -109,6 +109,6 @@ echo  Commands:
 echo    serve       start/reuse container and wait until healthy (default)
 echo    build       docker compose build - build image only
 echo    down        docker compose down  - stop ^& remove containers
-echo    --rebuild   force rebuild (--no-cache) and recreate the container
+echo    --rebuild   force rebuild and recreate the container
 echo.
 exit /b 0

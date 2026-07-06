@@ -1,4 +1,6 @@
 from typing import *
+import os
+import logging
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -9,6 +11,61 @@ import trimesh.visual
 from flex_gemm.ops.grid_sample import grid_sample_3d
 import nvdiffrast.torch as dr
 import cumesh
+
+
+logger = logging.getLogger("o_voxel.postprocess")
+# serve.py configures logging only on its own "trellis2.serve" logger and never
+# touches the root logger, so this library logger would otherwise inherit the
+# root default (WARNING) with no handler and drop every INFO line. Make it
+# self-sufficient: its own stderr handler at INFO, and no propagation so it
+# won't double-log if the root logger later gains handlers.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+# Optional cap on the dual-contouring grid resolution, decoupled from the
+# decoder resolution. The DC dense grid is O(resolution**3), so lowering this
+# cuts the peak cubically *and* runs faster; attribute fidelity is preserved
+# because colours/PBR are re-projected from the original hi-res mesh via the BVH
+# and the remesh is decimated to ``decimation_target`` regardless. 0 = no cap
+# (current behaviour). Only the geometric tessellation of the remesh coarsens.
+REMESH_MAX_RES = int(os.environ.get("OVOXEL_REMESH_MAX_RES", "0"))
+
+# Per-stage VRAM tracing for to_glb. Set OVOXEL_VRAM_LOG=0 to disable.
+VRAM_LOG = os.environ.get("OVOXEL_VRAM_LOG", "1") != "0"
+
+_vram_prev = None
+
+
+def _log_vram(label: str, detail: str = "") -> None:
+    """Log driver-level VRAM at a stage boundary.
+
+    ``mem_get_info`` reports the driver's free/total, so it captures raw
+    cudaMalloc allocations from CuMesh / flex_gemm / nvdiffrast that PyTorch's
+    own memory stats never see. ``max_memory_reserved`` additionally catches a
+    torch-side transient that was already freed by the time we sample here.
+    ``detail`` carries optional per-stage context (e.g. vertex/face counts).
+    """
+    global _vram_prev
+    if not (VRAM_LOG and torch.cuda.is_available()):
+        return
+    torch.cuda.synchronize()
+    free, total = torch.cuda.mem_get_info()
+    used = (total - free) / 1e9
+    delta = 0.0 if _vram_prev is None else used - _vram_prev
+    _vram_prev = used
+    reserved = torch.cuda.memory_reserved() / 1e9
+    peak = torch.cuda.max_memory_reserved() / 1e9
+    logger.info("[vram] %-26s driver_used=%.2fG (%+.2fG) torch_reserved=%.2fG "
+                "torch_peak_reserved=%.2fG%s", label, used, delta, reserved, peak,
+                f"  {detail}" if detail else "")
+    torch.cuda.reset_peak_memory_stats()
 
 
 # Creating an nvdiffrast CUDA context allocates GPU resources and compiles
@@ -155,9 +212,12 @@ def to_glb(
     vertices = vertices.cuda()
     faces = faces.cuda()
     
+    _log_vram("to_glb:entry")
+
     # Initialize CUDA mesh handler
     mesh = cumesh.CuMesh()
     mesh.init(vertices, faces)
+    _log_vram("after input.init", f"verts={vertices.shape[0]} faces={faces.shape[0]}")
     
     # --- Initial Mesh Cleaning ---
     # Fills holes as much as we can before processing
@@ -177,6 +237,7 @@ def to_glb(
         print(f"Building BVH for current mesh...", end='', flush=True)
     bvh = cumesh.cuBVH(vertices, faces)
     report(20, "BVH built")
+    _log_vram("after bvh build")
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -225,9 +286,20 @@ def to_glb(
         center = aabb.mean(dim=0)
         scale = (aabb[1] - aabb[0]).max().item()
         resolution = grid_size.max().item()
-        
-        # Perform Dual Contouring remeshing (rebuilds topology)
-        mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
+
+        # Cap the DC grid resolution to bound the O(resolution**3) peak. This is
+        # the dominant memory consumer of the whole to_glb call.
+        if REMESH_MAX_RES and resolution > REMESH_MAX_RES:
+            logger.info("capping remesh resolution %d -> %d", resolution, REMESH_MAX_RES)
+            resolution = REMESH_MAX_RES
+
+        # Release PyTorch's cached (reserved-but-unused) blocks back to the driver
+        # so CuMesh's raw cudaMalloc for the DC grid isn't competing with them.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Perform Dual Contouring remeshing (rebuilds topology).
+        rm = cumesh.remeshing.remesh_narrow_band_dc(
             vertices, faces,
             center = center,
             scale = (resolution + 3 * remesh_band) / resolution * scale,
@@ -236,7 +308,9 @@ def to_glb(
             project_back = remesh_project, # Snaps vertices back to original surface
             verbose = verbose,
             bvh = bvh,
-        ))
+        )
+        _log_vram("after remesh_dc", f"verts={rm[0].shape[0]} faces={rm[1].shape[0]}")
+        mesh.init(*rm)
         if verbose:
             print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
         
@@ -246,6 +320,7 @@ def to_glb(
             print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
 
     report(50, "mesh topology complete")
+    _log_vram("after remesh+simplify")
     
     if use_tqdm:
         pbar.update(1)
@@ -282,6 +357,7 @@ def to_glb(
     if verbose:
         print("Done")
     report(70, "UV unwrapping complete")
+    _log_vram("after uv_unwrap")
     
     # --- Texture Baking (Attribute Sampling) ---
     if use_tqdm:
@@ -308,17 +384,19 @@ def to_glb(
     
     # Mask of valid pixels in texture
     mask = rast[0, ..., 3] > 0
-    
+    _log_vram("after rasterize")
+
     # Interpolate 3D positions in UV space (finding 3D coord for every texel)
     pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
     valid_pos = pos[mask]
-    
+
     # Map these positions back to the *original* high-res mesh to get accurate attributes
     # This corrects geometric errors introduced by simplification/remeshing
     _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
     orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-    
+    _log_vram("after bvh project")
+
     # Trilinear sampling from the attribute volume (Color, Material props)
     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
     attrs[mask] = grid_sample_3d(
@@ -328,6 +406,7 @@ def to_glb(
         grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode='trilinear',
     )
+    _log_vram("after grid_sample_3d")
     if use_tqdm:
         pbar.update(1)
     if verbose:
