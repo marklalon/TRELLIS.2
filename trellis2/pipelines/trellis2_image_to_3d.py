@@ -65,6 +65,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     """
     Pipeline for inferring Trellis2 image-to-3D models.
 
+    .. note::
+        The ``'512'`` pipeline type reuses ``tex_slat_flow_model_1024`` for
+        texturing (the dedicated 512 texture model was dropped). The 1024
+        architecture is compatible because its RoPE position encoding handles
+        the 512 shape's smaller coordinate range, and fewer tokens keep
+        texture-stage VRAM below the 1024 path.
+
     Args:
         models (dict[str, nn.Module]): The models to use in the pipeline.
         sparse_structure_sampler (samplers.Sampler): The sampler for the sparse structure.
@@ -84,7 +91,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
         'shape_slat_decoder',
-        'tex_slat_flow_model_512',
         'tex_slat_flow_model_1024',
         'tex_slat_decoder',
     ]
@@ -634,7 +640,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
+            # The 512 texture model was dropped (blurry, VRAM-heavy). The 512
+            # pipeline reuses the 1024 texture model: same architecture, RoPE PE
+            # handles the 512 shape's smaller coord range, and fewer tokens keep
+            # texture-stage VRAM below the 1024 path.
+            assert 'tex_slat_flow_model_1024' in self.models, "No texture SLat flow model found (512 pipeline reuses the 1024 texture model)."
         elif pipeline_type == '1024':
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
@@ -655,7 +665,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         report(10, "encoding image conditions")
         torch.manual_seed(seed)
         cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        # cond_1024 is needed by every pipeline type: the non-512 types use it for
+        # shape/texture, and the 512 type now uses it for the 1024 texture model.
+        cond_1024 = self.get_cond([image], 1024)
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         report(20, "sampling sparse structure")
         coords = self.sample_sparse_structure(
@@ -669,8 +681,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 coords, shape_slat_sampler_params
             )
             report(65, "sampling texture")
+            # Texture uses the 1024 model with 1024 conditioning (its training
+            # distribution), even though the shape stays at 512.
             tex_slat = self.sample_tex_slat(
-                cond_512, self.models['tex_slat_flow_model_512'],
+                cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
             res = 512

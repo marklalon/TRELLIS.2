@@ -170,7 +170,7 @@ def main() -> None:
     parser.add_argument(
         "--simplify",
         type=int,
-        default=1000000,
+        default=5000000,
         help="Mesh simplify target vertex count / nvdiffrast limit (16777216)",
     )
     parser.add_argument(
