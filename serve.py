@@ -586,6 +586,7 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
                     del mesh
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    _schedule_flow_prewarm()
                     return data
 
         # Overlap path: the sampling lock is released here; the next request can
@@ -597,7 +598,52 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
             del mesh
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            _schedule_flow_prewarm()
             return data
+
+
+# Strong refs to fire-and-forget prewarm tasks so the loop can't GC them mid-run.
+_background_tasks: set = set()
+
+
+def _schedule_flow_prewarm() -> None:
+    """After a request finishes, kick off a background task that pages the flow
+    models back onto the GPU for the next request ("decode" offload mode only).
+
+    Fire-and-forget: it never delays returning this request's GLB, and the task
+    itself skips the work whenever another request is already sampling, so it
+    stays off every request's critical path.
+    """
+    pipeline = state.pipeline
+    if pipeline is None or getattr(pipeline, "_offload_mode", None) != "decode":
+        return
+    task = asyncio.create_task(_prewarm_flow_models_when_idle())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _prewarm_flow_models_when_idle() -> None:
+    """Warm the flow models back onto the GPU while the GPU is idle.
+
+    Concurrency: every flow-model device movement (page-in during sampling,
+    eviction before decode, and this prewarm) must be mutually exclusive, so we
+    do the prewarm under ``sampling_lock`` -- the same lock that guards
+    generation. If a request is already sampling we skip entirely rather than
+    queue: it pages in what it needs itself, and warming behind it would just
+    contend for the GPU. The event loop is single-threaded, so a ``False`` from
+    ``locked()`` guarantees the ``async with`` below takes the lock immediately
+    without yielding -- no request can slip in between the check and the acquire.
+    """
+    pipeline = state.pipeline
+    if pipeline is None or state.sampling_lock.locked():
+        return
+    async with state.sampling_lock:
+        if state.pipeline is None:
+            return
+        try:
+            await asyncio.to_thread(pipeline.prewarm_flow_models)
+        except Exception:
+            logger.exception("flow-model prewarm failed")
 
 
 def _decode_image(data: bytes) -> Image.Image:

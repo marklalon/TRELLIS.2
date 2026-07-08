@@ -118,9 +118,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         #                     stalls every stage (6 transfers/request).
         #   "decode"        - keep flow models resident through all sampling
         #                     stages (fast, no per-stage stalls), then evict them
-        #                     once before decode so decode+postprocess run without
-        #                     them. Restored lazily on the next request's
-        #                     sampling. ~4 transfers/request.
+        #                     once before decode so decode runs without them.
+        #                     The server prewarms them back onto the GPU *after*
+        #                     the request finishes (see prewarm_flow_models),
+        #                     while the GPU is idle, so the next request's
+        #                     sampling starts warm without stalling on a CPU->GPU
+        #                     transfer -- and without holding up any request,
+        #                     since the prewarm is skipped whenever another
+        #                     request is already sampling. The next request still
+        #                     evicts them before its own decode, so the decode
+        #                     VRAM peak is unchanged.
         _mode = os.environ.get("TRELLIS2_OFFLOAD", "0").strip().lower()
         if _mode in ("1", "true", "stage"):
             self._offload_mode = "stage"
@@ -129,6 +136,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             self._offload_mode = None
         self._offload = self._offload_mode is not None
+        # Flow-model keys the last request evicted before decode; "decode" mode
+        # prewarms exactly these back onto the GPU after the request finishes.
+        self._pending_prewarm: List[str] = []
         if models is None:
             return
         super().__init__(models)
@@ -265,7 +275,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
     def _evict_flow_models(self) -> None:
         """Page any resident flow model back to the CPU. Used before decode in
-        "decode" mode; a no-op in "stage" mode (already evicted) and when off."""
+        "decode" mode; a no-op in "stage" mode (already evicted) and when off.
+
+        Records the moved keys (the set this request used) in
+        ``self._pending_prewarm`` so ``prewarm_flow_models`` can page exactly
+        those back onto the GPU once the request has finished.
+        """
         if not self._offload:
             return
         moved = []
@@ -275,8 +290,34 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 model.cpu()
                 moved.append(key)
         if moved:
+            self._pending_prewarm = moved
             torch.cuda.empty_cache()
             logger.info("evicted flow models to CPU before decode (%s)",
+                        ", ".join(moved))
+
+    def prewarm_flow_models(self) -> None:
+        """Page the flow models used by the last request back onto the GPU so the
+        next request's sampling starts warm instead of stalling on a CPU->GPU
+        transfer ("decode" mode only; a no-op otherwise).
+
+        Intended to be called by the server *after* a request finishes, while the
+        GPU is idle, so it stays off every request's critical path. The caller
+        MUST serialize this against sampling -- i.e. hold the same lock that
+        guards ``run`` -- because every flow-model device movement must be
+        mutually exclusive. The next request still evicts these before its own
+        decode, so prewarming does not raise the decode-stage VRAM peak.
+        """
+        if not self._offload or self._offload_mode != "decode":
+            return
+        moved = []
+        for key in self._pending_prewarm:
+            model = self.models.get(key)
+            if (isinstance(model, nn.Module)
+                    and next(model.parameters()).device.type == 'cpu'):
+                model.to(self._device)
+                moved.append(key)
+        if moved:
+            logger.info("prewarmed flow models to GPU after request (%s)",
                         ", ".join(moved))
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:

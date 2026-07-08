@@ -36,6 +36,8 @@ services:
       # Cap remesh resolution, reduce remesh_narrow_band_dc VM usage.
       - OVOXEL_REMESH_MAX_RES=512
       - OVOXEL_VRAM_LOG=0
+      # WSL2 compatibility
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
     volumes:
       # Mount the project source code (read-write for development)
       - .:/workspace/TRELLIS.2
