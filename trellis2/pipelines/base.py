@@ -4,6 +4,18 @@ import torch.nn as nn
 from .. import models
 
 
+def _best_effort_trim_host_memory() -> None:
+    """Return freed CPU allocator arenas to the OS between large model loads."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _load_model_from_local(base_path: str, model_ref: str, device=None) -> nn.Module:
     """
     Resolve a model reference from pipeline.json against a local base path.
@@ -126,11 +138,14 @@ class Pipeline:
             if not hasattr(cls, 'model_names_to_load') or k in cls.model_names_to_load
         ]
         total = len(models_to_load)
-        # Checkpoint loading is dominated by disk I/O (safetensors releases the
-        # GIL while reading) and the H2D copy, so loading several at once
-        # overlaps those waits. Set TRELLIS2_LOAD_WORKERS=1 to load serially.
-        max_workers = max(1, int(os.environ.get("TRELLIS2_LOAD_WORKERS", "4")))
-        max_workers = min(max_workers, total) or 1
+        # Parallel loading is fast, but each worker also constructs a full CPU
+        # model skeleton before assign=True swaps in the GPU-resident weights.
+        # When loading straight to CUDA, that transient host-RAM spike is often
+        # the real startup bottleneck, so default to serial unless overridden.
+        max_workers = 1
+        trim_between_models = (
+            os.environ.get("TRELLIS2_TRIM_BETWEEN_MODELS", "1") == "1"
+        )
 
         progress_lock = threading.Lock()
         counter = {"n": 0}
@@ -152,10 +167,14 @@ class Pipeline:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for k, model in executor.map(_load_one, models_to_load):
                     _models[k] = model
+                    if trim_between_models:
+                        _best_effort_trim_host_memory()
         else:
             for item in models_to_load:
                 k, model = _load_one(item)
                 _models[k] = model
+                if trim_between_models:
+                    _best_effort_trim_host_memory()
 
         new_pipeline = cls(_models)
         new_pipeline._pretrained_args = args

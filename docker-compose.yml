@@ -27,7 +27,6 @@ services:
       - TRELLIS2_REMBG_MODEL_PATH=/models/briaai/RMBG-1.4
       - TRELLIS2_PORT=8000
       - TRELLIS2_PIPELINE=1024_cascade
-      - TRELLIS2_LOAD_WORKERS=1
       # Sequential CPU offload of the flow DiTs. Set to 1 on <=16GB GPUs: it pages
       # each 1.3B flow model to the GPU only for its sampling stage, dropping the
       # 1024_cascade peak from ~20.7GB to ~10-11GB (adds a few seconds/request of

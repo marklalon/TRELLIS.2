@@ -9,6 +9,18 @@ from torchvision import transforms
 from PIL import Image
 
 
+def _from_pretrained_low_cpu_mem_usage(model_name: str, **kwargs):
+    """Prefer Transformers' low-RAM weight loader when the install supports it."""
+    try:
+        return AutoModelForImageSegmentation.from_pretrained(
+            model_name,
+            low_cpu_mem_usage=True,
+            **kwargs,
+        )
+    except TypeError:
+        return AutoModelForImageSegmentation.from_pretrained(model_name, **kwargs)
+
+
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
         self.model_name = model_name
@@ -42,8 +54,9 @@ class BiRefNet:
                 checkpoint = os.path.join(model_name, "model.safetensors")
                 self.model.load_state_dict(load_file(checkpoint), strict=True)
             else:
-                self.model = AutoModelForImageSegmentation.from_pretrained(
-                    model_name, trust_remote_code=True
+                self.model = _from_pretrained_low_cpu_mem_usage(
+                    model_name,
+                    trust_remote_code=True,
                 )
         self.model.eval()
         normalize = (

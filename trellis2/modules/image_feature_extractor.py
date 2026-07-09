@@ -7,6 +7,14 @@ import numpy as np
 from PIL import Image
 
 
+def _load_hf_model_low_cpu_mem_usage(model_cls, model_name: str):
+    """Use Transformers' low-RAM path when available, with old-version fallback."""
+    try:
+        return model_cls.from_pretrained(model_name, low_cpu_mem_usage=True)
+    except TypeError:
+        return model_cls.from_pretrained(model_name)
+
+
 class DinoV2FeatureExtractor:
     """
     Feature extractor for DINOv2 models.
@@ -62,7 +70,7 @@ class DinoV3FeatureExtractor:
     """
     def __init__(self, model_name: str, image_size=512):
         self.model_name = model_name
-        self.model = DINOv3ViTModel.from_pretrained(model_name)
+        self.model = _load_hf_model_low_cpu_mem_usage(DINOv3ViTModel, model_name)
         self.model.eval()
         self.image_size = image_size
         self.transform = transforms.Compose([
