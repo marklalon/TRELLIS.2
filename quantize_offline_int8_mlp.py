@@ -115,6 +115,10 @@ def main() -> None:
                     help="flow model keys to copy in bf16 instead of quantizing. Default keeps "
                          "shape_slat_flow_model_512 (the cascade coarse driver) exact, since "
                          "quantizing it amplifies geometry error through the 512->1024 cascade.")
+    ap.add_argument("--copy-encoder", default="ckpts/shape_enc_next_dc_f16c32_fp16",
+                    help="extra checkpoint (the shape encoder) to copy verbatim so the quantized "
+                         "directory also serves texture-only (image+mesh) requests. It is not part "
+                         "of pipeline.json, so it is copied explicitly. Pass empty to skip.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -159,13 +163,27 @@ def main() -> None:
     with open(os.path.join(dst, "pipeline.json"), "w") as f:
         json.dump(pipeline_cfg, f, indent=2)
 
+    # Texture-only mode (image + mesh -> textured mesh) additionally needs the
+    # shape encoder, which is NOT listed in pipeline.json (it belongs to the
+    # texturing pipeline). Copy it verbatim (it is fp16 and left unquantized) so
+    # this quantized directory can also serve texture-only requests.
+    enc_ref = args.copy_encoder
+    if enc_ref:
+        enc_src = os.path.join(src, enc_ref)
+        if os.path.exists(f"{enc_src}.safetensors") and os.path.exists(f"{enc_src}.json"):
+            copy_checkpoint(enc_src, os.path.join(dst, enc_ref), "shape_slat_encoder")
+        else:
+            log.warning("  shape encoder not found at %s(.json/.safetensors); "
+                        "texture-only mode will be unavailable against this dir", enc_src)
+
     log.info("=" * 64)
     log.info("done in %.1f min | flow weights %.2f -> %.2f GB (saved %.2f GB)",
              (time.perf_counter() - t0) / 60, total_orig / 1e9, total_new / 1e9,
              (total_orig - total_new) / 1e9)
     log.info("output: %s", dst)
     log.info("serve with: TRELLIS2_MODEL_PATH=%s  (+ TRELLIS2_OFFLOAD=1 for <=16GB)", dst)
-    log.info("note: texturing_pipeline.json is NOT written; this dir targets the image-to-3D pipeline.")
+    log.info("note: texturing_pipeline.json is NOT written; this dir targets the image-to-3D "
+             "pipeline, plus the shape encoder copied above for texture-only (image+mesh) mode.")
 
 
 if __name__ == "__main__":

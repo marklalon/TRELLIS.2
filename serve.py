@@ -146,6 +146,10 @@ def _run_startup_stage(label: str, operation: Callable[[], T]) -> T:
 
 class _State:
     pipeline: Optional[object] = None
+    # Texture-only pipeline (image + mesh -> textured mesh). Shares the resident
+    # tex flow model / decoder / DINO / rembg with ``pipeline`` and additionally
+    # holds a shape_slat_encoder. None if texturing could not be initialized.
+    texturing_pipeline: Optional[object] = None
     # Generation is split into two phases with separate locks so the GPU-light
     # post-processing tail of one request (cumesh UV/BVH/remesh, GLB export —
     # latency-bound work that barely touches the GPU) can overlap the GPU-heavy
@@ -292,6 +296,13 @@ class GenParams(BaseModel):
     texture_sampling_steps: int = 12             # tex SLat sampling steps
     shape_sampling_steps: int = 12               # shape SLat sampling steps
     alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
+    # Generation mode:
+    #   full    - image -> textured GLB (shape + texture; default).
+    #   mesh    - image -> white GLB (shape only, no UVs, no texture).
+    #   texture - image + input GLB -> textured GLB (re-texture an existing
+    #             mesh; the client sends the GLB as a second binary frame).
+    #             Texture is sampled at 1024 (the only resident texture model).
+    mode: Literal['full', 'mesh', 'texture'] = 'full'
 
 
 def _load_pipeline():
@@ -345,8 +356,61 @@ def _load_pipeline():
     state.loaded_at = time.time()
     logger.info("Pipeline ready (fully resident in VRAM); default type=%s",
                 DEFAULT_PIPELINE)
+    _run_startup_stage("initializing texturing pipeline", _init_texturing_pipeline)
     if TRIM_MEMORY:
         _run_startup_stage("releasing transient host memory", _trim_host_memory)
+
+
+# The texturing (image + mesh -> textured mesh) capability reuses the resident
+# pipeline's tex flow model, tex decoder, image encoder and background remover;
+# the only extra weight is the shape encoder, which the image-to-3D pipeline
+# does not otherwise load. Set TRELLIS2_ENABLE_TEXTURING=0 to skip it entirely
+# (texture-only requests then return an error) and avoid the extra VRAM.
+ENABLE_TEXTURING = os.environ.get("TRELLIS2_ENABLE_TEXTURING", "1") == "1"
+SHAPE_ENCODER_REF = os.environ.get(
+    "TRELLIS2_SHAPE_ENCODER_REF", "ckpts/shape_enc_next_dc_f16c32_fp16"
+)
+
+
+def _init_texturing_pipeline() -> None:
+    """Build a Trellis2TexturingPipeline that shares the resident models and adds
+    a shape encoder. Failure is non-fatal: texture-only requests are rejected but
+    image-to-3D (full / mesh-only) generation still works."""
+    if not ENABLE_TEXTURING:
+        logger.info("Texturing disabled (TRELLIS2_ENABLE_TEXTURING=0); "
+                    "texture-only requests will be rejected")
+        return
+    try:
+        from trellis2.pipelines import Trellis2TexturingPipeline
+        from trellis2.pipelines.base import _load_model_from_local
+
+        pipeline = state.pipeline
+        encoder = _load_model_from_local(MODEL_PATH, SHAPE_ENCODER_REF, device="cuda")
+        encoder.eval()
+
+        tex = Trellis2TexturingPipeline.__new__(Trellis2TexturingPipeline)
+        tex.models = {
+            'shape_slat_encoder': encoder,
+            'tex_slat_decoder': pipeline.models['tex_slat_decoder'],
+            'tex_slat_flow_model_1024': pipeline.models['tex_slat_flow_model_1024'],
+        }
+        if 'tex_slat_flow_model_512' in pipeline.models:
+            tex.models['tex_slat_flow_model_512'] = pipeline.models['tex_slat_flow_model_512']
+        tex.tex_slat_sampler = pipeline.tex_slat_sampler
+        tex.tex_slat_sampler_params = pipeline.tex_slat_sampler_params
+        tex.shape_slat_normalization = pipeline.shape_slat_normalization
+        tex.tex_slat_normalization = pipeline.tex_slat_normalization
+        tex.image_cond_model = pipeline.image_cond_model
+        tex.rembg_model = pipeline.rembg_model
+        tex.pbr_attr_layout = pipeline.pbr_attr_layout
+        tex._device = 'cuda'
+        state.texturing_pipeline = tex
+        logger.info("Texturing pipeline ready (shares resident tex models + "
+                    "shape encoder '%s')", SHAPE_ENCODER_REF)
+    except Exception:
+        logger.exception("Texturing pipeline init failed; texture-only requests "
+                         "will be rejected")
+        state.texturing_pipeline = None
 
 
 async def _background_rembg_warmup() -> None:
@@ -408,14 +472,70 @@ class _ProgressReporter:
         self.raise_if_cancelled()
 
 
+def _ensure_tex_flow_resident() -> None:
+    """Page the shared texture flow model back onto the GPU if CPU offload left
+    it evicted. Texture-only sampling does not go through the offload-aware
+    ``_resident`` context, so it must be resident before we sample."""
+    pipeline = state.pipeline
+    if pipeline is None or not getattr(pipeline, "_offload", False):
+        return
+    model = pipeline.models.get('tex_slat_flow_model_1024')
+    if model is None:
+        return
+    try:
+        if next(model.parameters()).device.type != 'cuda':
+            model.to('cuda')
+            logger.info("paged tex flow model onto GPU for texturing")
+    except StopIteration:
+        pass
+
+
+@torch.inference_mode()
+def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
+                          input_mesh, params: GenParams):
+    """GPU-heavy phase for texture-only mode: encode an existing mesh + image and
+    sample/decode a texture, returning a fully textured trimesh."""
+    tex_pipeline = state.texturing_pipeline
+    if tex_pipeline is None:
+        raise RuntimeError(
+            "texture-only mode is unavailable (texturing pipeline not loaded)"
+        )
+    # The resident image-to-3D pipeline only loads the 1024 texture flow model,
+    # so texturing always runs at 1024.
+    _ensure_tex_flow_resident()
+    reporter.report(15, "encoding mesh and texturing")
+    out = tex_pipeline.run(
+        input_mesh,
+        image,
+        seed=params.seed,
+        tex_slat_sampler_params={
+            "steps": params.texture_sampling_steps,
+            "cancellation_callback": reporter.raise_if_cancelled,
+        },
+        preprocess_image=params.preprocess_image,
+        resolution=1024,
+        texture_size=params.texture_size,
+    )
+    # Restore the offload baseline (evict the flow model back to CPU) so the next
+    # image-to-3D request's decode peak is unchanged.
+    if getattr(state.pipeline, "_offload", False):
+        state.pipeline._evict_flow_models()
+    reporter.report(72, "texture sampled")
+    return out
+
+
 @torch.inference_mode()
 def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
-                  params: GenParams):
+                  params: GenParams, input_mesh=None):
     """GPU-heavy phase: model sampling + VAE decode. Must run under the
-    sampling lock. Returns the decoded mesh (GPU-resident)."""
+    sampling lock. Returns the decoded mesh (GPU-resident) for full/mesh modes,
+    or a textured trimesh for texture mode."""
     pipeline = state.pipeline
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    if params.mode == 'texture':
+        return _run_texture_sampling(reporter, image, input_mesh, params)
 
     def pipeline_progress(percent: int, stage: str) -> None:
         # The model pipeline is about 70% of the complete request; the rest is
@@ -428,6 +548,7 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
         preprocess_image=params.preprocess_image,
+        generate_texture=params.mode != 'mesh',
         sparse_structure_sampler_params={
             "cancellation_callback": reporter.raise_if_cancelled,
         },
@@ -446,12 +567,38 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
     return mesh
 
 
+def _export_glb_bytes(glb, extension_webp: bool) -> bytes:
+    """Export a trimesh to GLB bytes via a temp file (trimesh has no direct
+    bytes export for GLB with the webp texture extension)."""
+    with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        glb.export(tmp_path, extension_webp=extension_webp)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 @torch.inference_mode()
 def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> bytes:
     """GPU-light phase: GLB texturing/geometry (cumesh) + export. Must run
     under the post-processing lock. This is the latency-bound tail that barely
     uses the GPU, so it is allowed to overlap the next request's sampling."""
-    reporter.report(78, "building GLB textures and materials")
+    # Texture mode: sampling already produced a fully textured trimesh; just
+    # export it. It carries a texture, so keep the fast WebP encoding.
+    if params.mode == 'texture':
+        reporter.report(90, "exporting textured GLB")
+        data = _export_glb_bytes(mesh, extension_webp=True)
+        reporter.report(100, f"complete ({len(data)} bytes)")
+        return data
+
+    geometry_only = params.mode == 'mesh'
+    reporter.report(78, "building white mesh" if geometry_only
+                    else "building GLB textures and materials")
 
     def postprocess_progress(percent: int, stage: str) -> None:
         reporter.report(78 + round(percent * 0.17), stage)
@@ -467,6 +614,7 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
         decimation_target=params.decimation_target,
         texture_size=params.texture_size,
         alpha_mode=params.alpha_mode,
+        geometry_only=geometry_only,
         remesh=True,
         remesh_band=1,
         remesh_project=0,
@@ -474,23 +622,12 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
         progress_callback=postprocess_progress,
     )
 
-    # Export to a temp file then read bytes (to_glb returns a trimesh object).
-    with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        reporter.report(95, "exporting GLB")
-        # WebP texture encoding is markedly faster than PNG's single-threaded
-        # zlib path and produces smaller GLBs. Requires Pillow built with WebP
-        # support (libwebp-dev) and a client/viewer that understands the
-        # EXT_texture_webp glTF extension.
-        glb.export(tmp_path, extension_webp=True)
-        with open(tmp_path, "rb") as f:
-            data = f.read()
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    reporter.report(95, "exporting GLB")
+    # WebP texture encoding is markedly faster than PNG's single-threaded zlib
+    # path and produces smaller GLBs (no-op for a white, texture-less mesh).
+    # Requires Pillow built with WebP support (libwebp-dev) and a client/viewer
+    # that understands the EXT_texture_webp glTF extension.
+    data = _export_glb_bytes(glb, extension_webp=not geometry_only)
     reporter.report(100, f"complete ({len(data)} bytes)")
     return data
 
@@ -550,7 +687,8 @@ class _VramPeakMonitor:
 
 async def _generate(image: Image.Image, params: GenParams, request_id: str,
                     progress_callback=None,
-                    cancellation: Optional[_CancellationToken] = None) -> bytes:
+                    cancellation: Optional[_CancellationToken] = None,
+                    input_mesh=None) -> bytes:
     """Two-phase image -> GLB.
 
     Phase 1 (sampling) holds the sampling lock and saturates the GPU. Phase 2
@@ -571,7 +709,8 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
                         time.monotonic() - wait_started)
             try:
                 mesh = await _to_thread_cancellable(
-                    _run_sampling, reporter, image, params, cancellation=cancellation
+                    _run_sampling, reporter, image, params, input_mesh,
+                    cancellation=cancellation,
                 )
             finally:
                 state.busy = False
@@ -650,6 +789,19 @@ def _decode_image(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
+def _decode_mesh(data: bytes):
+    """Load an uploaded GLB (texture-only mode) into a single trimesh."""
+    import trimesh
+    loaded = trimesh.load(io.BytesIO(data), file_type="glb", process=False)
+    if isinstance(loaded, trimesh.Scene):
+        if len(loaded.geometry) == 0:
+            raise ValueError("no geometry found in uploaded GLB")
+        loaded = loaded.dump(concatenate=True)
+    if not hasattr(loaded, "vertices") or not hasattr(loaded, "faces"):
+        raise ValueError("uploaded file did not contain a triangle mesh")
+    return loaded
+
+
 async def _watch_ws_cancellation(
     ws: WebSocket, cancellation: _CancellationToken, request_id: str
 ) -> bool:
@@ -708,8 +860,9 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     Protocol:
-      client -> {"seed": 42, ...params}        (JSON text frame)
+      client -> {"seed": 42, "mode": "full"|"mesh"|"texture", ...params}  (JSON text frame)
       client -> <raw image bytes>               (binary frame)
+      client -> <raw GLB bytes>                 (binary frame; only when mode="texture")
       client -> {"type": "cancel"}               (while generation is running)
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
       server -> {"stage": "done", "glb_size": N, ...}  (JSON text frame)
@@ -730,6 +883,13 @@ async def ws_generate(ws: WebSocket):
             await ws.send_json({"stage": "error", "message": "model still loading"})
             await ws.close()
             return
+        params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields})
+        if params.mode == 'texture' and state.texturing_pipeline is None:
+            logger.warning("[%s] rejected: texture mode unavailable", request_id)
+            await ws.send_json({"stage": "error",
+                                "message": "texture-only mode is not enabled on this server"})
+            await ws.close()
+            return
         try:
             image_data = await ws.receive_bytes()
             img = _decode_image(image_data)
@@ -738,7 +898,21 @@ async def ws_generate(ws: WebSocket):
             await ws.send_json({"stage": "error", "message": f"invalid image: {e}"})
             await ws.close()
             return
-        params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields})
+
+        input_mesh = None
+        if params.mode == 'texture':
+            try:
+                mesh_data = await ws.receive_bytes()
+                input_mesh = _decode_mesh(mesh_data)
+            except Exception as e:
+                logger.warning("[%s] invalid mesh: %s", request_id, e)
+                await ws.send_json({"stage": "error", "message": f"invalid mesh: {e}"})
+                await ws.close()
+                return
+            logger.info("[%s] mesh decoded bytes=%d verts=%d faces=%d",
+                        request_id, len(mesh_data),
+                        len(input_mesh.vertices), len(input_mesh.faces))
+
         logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s params=%s",
                     request_id, len(image_data), img.width, img.height, img.mode,
                     params.model_dump())
@@ -772,7 +946,7 @@ async def ws_generate(ws: WebSocket):
         generation_task = asyncio.create_task(
             _generate(
                 img, params, request_id, send_progress,
-                cancellation=cancellation,
+                cancellation=cancellation, input_mesh=input_mesh,
             )
         )
         receiver_task = asyncio.create_task(

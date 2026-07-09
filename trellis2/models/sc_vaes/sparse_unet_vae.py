@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from ...modules.utils import convert_module_to, convert_module_to_f16, convert_module_to_f32, zero_module
+from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
@@ -505,17 +505,6 @@ class SparseUnetVaeDecoder(nn.Module):
         Convert the torso of the model to float32.
         """
         self.blocks.apply(convert_module_to_f32)
-
-    def set_compute_dtype(self, dtype: torch.dtype) -> None:
-        """Switch the torso compute dtype at runtime (both the block weights and
-        the ``h.type(self.dtype)`` activation cast in ``forward``). The boundary
-        layers (``from_latent``/``output_layer``) are left untouched, so the
-        latent input and the decoded output keep their original dtype. Used by
-        the pipeline's optional fp16-decode switch to halve the decode-stage
-        activation footprint at the finest resolution.
-        """
-        self.dtype = dtype
-        self.blocks.apply(lambda m: convert_module_to(m, dtype))
 
     def initialize_weights(self) -> None:
         # Initialize transformer layers:

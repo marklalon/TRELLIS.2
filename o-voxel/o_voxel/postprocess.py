@@ -132,6 +132,7 @@ def to_glb(
     mesh_cluster_global_iterations=1,
     mesh_cluster_smooth_strength=1,
     alpha_mode: str = 'OPAQUE',
+    geometry_only: bool = False,
     verbose: bool = False,
     use_tqdm: bool = False,
     progress_callback: Optional[Callable[[int, str], None]] = None,
@@ -159,6 +160,9 @@ def to_glb(
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
         mesh_cluster_smooth_strength: strength of smoothing for clustering in uv unwrapping
         alpha_mode: glTF alpha mode - 'OPAQUE', 'MASK', or 'BLEND'
+        geometry_only: if True, skip UV unwrapping and texture baking and return
+            a plain (white, UV-less) mesh after remeshing/simplification/cleanup.
+            ``attr_volume``, ``coords`` and ``attr_layout`` may be None.
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
         progress_callback: optional ``(percent, stage)`` progress callback
@@ -168,11 +172,14 @@ def to_glb(
             progress_callback(percent, stage)
 
     report(0, "preparing mesh")
+    # Attribute tensors are absent in geometry-only mode; anchor device math to
+    # the vertices instead of the (possibly None) voxel coords.
+    ref_device = coords.device if coords is not None else vertices.device
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):
         aabb = np.array(aabb)
     if isinstance(aabb, np.ndarray):
-        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device)
+        aabb = torch.tensor(aabb, dtype=torch.float32, device=ref_device)
     assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
     assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
     assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
@@ -185,7 +192,7 @@ def to_glb(
         if isinstance(voxel_size, (list, tuple)):
             voxel_size = np.array(voxel_size)
         if isinstance(voxel_size, np.ndarray):
-            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device)
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=ref_device)
         grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
     else:
         assert grid_size is not None, "Either voxel_size or grid_size must be provided"
@@ -194,7 +201,7 @@ def to_glb(
         if isinstance(grid_size, (list, tuple)):
             grid_size = np.array(grid_size)
         if isinstance(grid_size, np.ndarray):
-            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device)
+            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=ref_device)
         voxel_size = (aabb[1] - aabb[0]) / grid_size
     
     # Assertions for dimensions
@@ -321,13 +328,41 @@ def to_glb(
 
     report(50, "mesh topology complete")
     _log_vram("after remesh+simplify")
-    
+
     if use_tqdm:
         pbar.update(1)
     if verbose:
         print("Done")
-        
-    
+
+    # --- Geometry-only (white mesh) short-circuit ---
+    # Skip UV unwrapping and texture baking entirely: return a plain mesh with
+    # vertex normals but no UVs and no material.
+    if geometry_only:
+        report(70, "reading geometry")
+        out_vertices, out_faces = mesh.read()
+        mesh.compute_vertex_normals()
+        out_normals = mesh.read_vertex_normals()
+
+        vertices_np = out_vertices.cpu().numpy()
+        faces_np = out_faces.cpu().numpy()
+        normals_np = out_normals.cpu().numpy()
+
+        # Swap Y and Z axes, invert Y (same GLB coordinate convention as the
+        # textured path) so mesh-only and full outputs are oriented identically.
+        vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+        normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2], -normals_np[:, 1]
+
+        white_mesh = trimesh.Trimesh(
+            vertices=vertices_np,
+            faces=faces_np,
+            vertex_normals=normals_np,
+            process=False,
+        )
+        if use_tqdm:
+            pbar.close()
+        report(100, "white mesh ready")
+        return white_mesh
+
     # --- UV Parameterization ---
     if use_tqdm:
         pbar.set_description("Parameterizing new mesh")

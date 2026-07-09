@@ -136,21 +136,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             self._offload_mode = None
         self._offload = self._offload_mode is not None
-        # Optional fp16 VAE-decode switch (for quality A/B). The shape/texture
-        # decoder torsos otherwise run in their configured precision.
-        #   unset  - leave the decoders as loaded (no forced conversion).
-        #   "1"    - run the decoder torsos in fp16; roughly halves the decode
-        #            activation peak at the finest resolution.
-        #   "0"    - force the torsos to fp32 (full-precision baseline to compare
-        #            quality against). Boundary layers stay fp32 either way, so
-        #            the latent input and decoded output dtype are unchanged.
-        _fp16 = os.environ.get("TRELLIS2_DECODE_FP16", "").strip().lower()
-        if _fp16 in ("1", "true", "yes", "on"):
-            self._decode_fp16 = True
-        elif _fp16 in ("0", "false", "no", "off"):
-            self._decode_fp16 = False
-        else:
-            self._decode_fp16 = None
         # Flow-model keys the last request evicted before decode; "decode" mode
         # prewarms exactly these back onto the GPU after the request finishes.
         self._pending_prewarm: List[str] = []
@@ -252,25 +237,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         peak-VRAM decode, so they are the ones we page to CPU."""
         return 'flow' in model_key
 
-    def _apply_decode_precision(self) -> None:
-        """Force the shape/texture VAE decoder torsos to the fp16-decode switch's
-        dtype (a no-op when the switch is unset). See ``TRELLIS2_DECODE_FP16``."""
-        if self._decode_fp16 is None:
-            return
-        dtype = torch.float16 if self._decode_fp16 else torch.float32
-        changed = []
-        for key in ('shape_slat_decoder', 'tex_slat_decoder'):
-            model = self.models.get(key)
-            if isinstance(model, nn.Module) and hasattr(model, 'set_compute_dtype'):
-                model.set_compute_dtype(dtype)
-                changed.append(key)
-        if changed:
-            logger.info("VAE decode precision forced to %s (%s)",
-                        dtype, ", ".join(changed))
-
     def cuda(self) -> None:
         super().cuda()
-        self._apply_decode_precision()
         if self._offload:
             # Start the flow models on the CPU; _resident pages them in on demand.
             # decoders / image encoder stay resident.
@@ -655,6 +623,24 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         _log_decode_peak("before")
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
         _log_decode_peak("shape_slat")
+        # Mesh-only path: no texture latent was sampled, so return geometry with
+        # empty voxel attributes (postprocess exports a white, UV-less mesh).
+        if tex_slat is None:
+            out_mesh = []
+            for m in meshes:
+                m.fill_holes()
+                out_mesh.append(
+                    MeshWithVoxel(
+                        m.vertices, m.faces,
+                        origin = [-0.5, -0.5, -0.5],
+                        voxel_size = 1 / resolution,
+                        coords = None,
+                        attrs = None,
+                        voxel_shape = None,
+                        layout=self.pbr_attr_layout
+                    )
+                )
+            return out_mesh
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         _log_decode_peak("tex_slat")
         out_mesh = []
@@ -686,6 +672,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        generate_texture: bool = True,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> List[MeshWithVoxel]:
         """
@@ -702,6 +689,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            generate_texture (bool): Whether to sample/decode the texture latent.
+                When False, only the shape is produced (a white, UV-less mesh),
+                skipping the texture flow model and texture decoder entirely.
             progress_callback (callable): Optional ``(percent, stage)`` callback.
         """
         def report(percent: int, stage: str) -> None:
@@ -753,23 +743,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_512, self.models['shape_slat_flow_model_512'],
                 coords, shape_slat_sampler_params
             )
-            report(65, "sampling texture")
-            # Texture uses the 1024 model with 1024 conditioning (its training
-            # distribution), even though the shape stays at 512.
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
-            )
             res = 512
         elif pipeline_type == '1024':
             shape_slat = self.sample_shape_slat(
                 cond_1024, self.models['shape_slat_flow_model_1024'],
                 coords, shape_slat_sampler_params
-            )
-            report(65, "sampling texture")
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
             )
             res = 1024
         elif pipeline_type == '1024_cascade':
@@ -780,11 +758,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 coords, shape_slat_sampler_params,
                 max_num_tokens
             )
-            report(65, "sampling texture")
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
-            )
         elif pipeline_type == '1536_cascade':
             shape_slat, res = self.sample_shape_slat_cascade(
                 cond_512, cond_1024,
@@ -793,6 +766,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 coords, shape_slat_sampler_params,
                 max_num_tokens
             )
+        # Texture always uses the 1024 model with 1024 conditioning (its training
+        # distribution), even when the shape stays at 512. Skipped entirely for
+        # mesh-only (white model) generation.
+        tex_slat = None
+        if generate_texture:
             report(65, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_1024, self.models['tex_slat_flow_model_1024'],
@@ -800,7 +778,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             )
         self._evict_flow_models()
         torch.cuda.empty_cache()
-        report(85, "decoding mesh and texture")
+        report(85, "decoding mesh" + (" and texture" if generate_texture else ""))
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
         report(100, "pipeline complete")
         if return_latent:

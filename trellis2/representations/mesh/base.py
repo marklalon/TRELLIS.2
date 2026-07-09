@@ -213,8 +213,8 @@ class MeshWithVoxel(Mesh, Voxel):
             self.faces.to(device, non_blocking=non_blocking),
             self.origin.tolist(),
             self.voxel_size,
-            self.coords.to(device, non_blocking=non_blocking),
-            self.attrs.to(device, non_blocking=non_blocking),
+            self.coords.to(device, non_blocking=non_blocking) if self.coords is not None else None,
+            self.attrs.to(device, non_blocking=non_blocking) if self.attrs is not None else None,
             self.voxel_shape,
             self.layout,
         )

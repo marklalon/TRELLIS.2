@@ -1,9 +1,14 @@
-"""TRELLIS.2 WebSocket client — stream progress and save a textured GLB.
+"""TRELLIS.2 WebSocket client — stream progress and save a GLB.
+
+Modes:
+    full     image -> textured GLB (default)
+    mesh     image -> white GLB (geometry only, no UVs / texture)
+    texture  image + input mesh -> textured GLB (re-texture an existing mesh)
 
 Example:
     python trellis2_client.py --image assets/example_image/T.png --output out.glb
-    python trellis2_client.py --image in.png --server http://HOST:8000 \
-        --pipeline-type 512
+    python trellis2_client.py --image in.png --mode mesh --output white.glb
+    python trellis2_client.py --image in.png --mode texture --input-mesh model.glb --output textured.glb
 
 Requires the ``websockets`` package.
 """
@@ -67,8 +72,16 @@ async def _run(args) -> None:
     with open(args.image, "rb") as f:
         image_bytes = f.read()
 
+    mesh_bytes = None
+    if args.mode == "texture":
+        if not args.input_mesh:
+            raise RuntimeError("--input-mesh is required when --mode texture")
+        with open(args.input_mesh, "rb") as f:
+            mesh_bytes = f.read()
+
     payload = {
         "seed": args.seed,
+        "mode": args.mode,
         "texture_size": args.texture_size,
         "decimation_target": args.decimation_target,
         "simplify": args.simplify,
@@ -90,6 +103,8 @@ async def _run(args) -> None:
         ) as ws:
             await ws.send(json.dumps(payload))
             await ws.send(image_bytes)
+            if mesh_bytes is not None:
+                await ws.send(mesh_bytes)
 
             try:
                 async for raw_message in ws:
@@ -144,6 +159,18 @@ def main() -> None:
     parser.add_argument("--image", required=True, help="Input image path")
     parser.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
     parser.add_argument("--server", default="http://localhost:8086", help="Server base URL")
+    parser.add_argument(
+        "--mode",
+        default="full",
+        choices=["full", "mesh", "texture"],
+        help="full: textured GLB (default); mesh: white geometry only; "
+             "texture: re-texture --input-mesh with --image",
+    )
+    parser.add_argument(
+        "--input-mesh",
+        default=None,
+        help="Input GLB path (required for --mode texture)",
+    )
     # Kept so existing commands using --ws continue to work; WebSocket is now
     # always enabled.
     parser.add_argument("--ws", action="store_true", help=argparse.SUPPRESS)

@@ -33,10 +33,6 @@ services:
       # 1024_cascade peak from ~20.7GB to ~10-11GB (adds a few seconds/request of
       # PCIe transfer). Leave 0 on large-VRAM cards.
       - TRELLIS2_OFFLOAD=stage
-      # fp16 VAE decode: runs the shape/texture decoder torsos in fp16 to roughly
-      # halve the finest-resolution decode activation peak. Set to 0 to force the
-      # full-precision (fp32) baseline for a quality A/B comparison.
-      - TRELLIS2_DECODE_FP16=1
       # Release freed-but-cached allocator blocks at each VAE-decode resolution
       # boundary (before every upsample stage, incl. the res3 C2S that grows the
       # token count ~1.8M -> 7.7M). Tames the reserved-pool fragmentation that

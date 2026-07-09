@@ -285,7 +285,15 @@ class Trellis2TexturingPipeline(Pipeline):
             vertices = vertices_torch.cpu().numpy()
             faces = faces_torch.cpu().numpy()
             uvs = uvs_torch.cpu().numpy()
-            normals = normals[vmap.cpu().numpy()]
+            # Recompute vertex normals on the unwrapped cumesh topology and remap
+            # them through vmap (same approach as o_voxel.postprocess.to_glb). The
+            # input trimesh's own vertex_normals array does NOT line up with
+            # uv_unwrap's vertex ordering, so indexing it by vmap scrambled the
+            # normals (they ended up uncorrelated with the geometry, breaking PBR
+            # shading in viewers).
+            _cumesh.compute_vertex_normals()
+            cu_normals = _cumesh.read_vertex_normals()
+            normals = cu_normals[vmap.to(cu_normals.device)].cpu().numpy()
                 
         # rasterize
         ctx = dr.RasterizeCudaContext()
