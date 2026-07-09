@@ -302,7 +302,6 @@ class GenParams(BaseModel):
     decimation_target: int = 100000
     simplify: int = 16777216                     # nvdiffrast vertex limit
     max_num_tokens: int = 49152
-    preprocess_image: bool = True
     texture_sampling_steps: int = 12             # tex SLat sampling steps
     shape_sampling_steps: int = 12               # shape SLat sampling steps
     tex_shape_slat: int = 512                    # mesh encoding grid resolution in texture mode
@@ -553,11 +552,11 @@ def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
         input_mesh,
         image,
         seed=params.seed,
+        preprocess_image=True,
         tex_slat_sampler_params={
             "steps": params.texture_sampling_steps,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
-        preprocess_image=params.preprocess_image,
         resolution=params.tex_shape_slat,
         texture_size=params.texture_size,
         on_shape_encoded=_ensure_tex_flow_resident,
@@ -590,7 +589,7 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         seed=params.seed,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
-        preprocess_image=params.preprocess_image,
+        preprocess_image=True,
         generate_texture=params.mode != 'mesh',
         sparse_structure_sampler_params={
             "cancellation_callback": reporter.raise_if_cancelled,

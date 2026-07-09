@@ -90,7 +90,6 @@ async def _run(args) -> None:
         "texture_sampling_steps": args.texture_sampling_steps,
         "shape_sampling_steps": args.shape_sampling_steps,
         "alpha_mode": args.alpha_mode,
-        "preprocess_image": True,
     }
     payload["pipeline_type"] = args.pipeline_type
     payload["tex_shape_slat"] = args.tex_shape_slat

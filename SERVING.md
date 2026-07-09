@@ -48,7 +48,8 @@ python serve.py --host 0.0.0.0 --port 8000
 
 Generation params (form fields / JSON keys): `seed`, `pipeline_type`,
 `texture_size` (default 2048), `decimation_target` (default 100000),
-`max_num_tokens` (default 49152), and `preprocess_image` (default true).
+`max_num_tokens` (default 49152).
+Image preprocessing is always enabled.
 Remeshing and source-mesh attribute projection are always enabled because both
 are required for acceptable mesh quality.
 
