@@ -32,7 +32,7 @@ services:
       # each 1.3B flow model to the GPU only for its sampling stage, dropping the
       # 1024_cascade peak from ~20.7GB to ~10-11GB (adds a few seconds/request of
       # PCIe transfer). Leave 0 on large-VRAM cards.
-      - TRELLIS2_OFFLOAD=decode
+      - TRELLIS2_OFFLOAD=stage
       # Cap remesh resolution, reduce remesh_narrow_band_dc VM usage.
       - OVOXEL_REMESH_MAX_RES=512
       - OVOXEL_VRAM_LOG=0
