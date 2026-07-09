@@ -1,14 +1,16 @@
-"""TRELLIS.2 WebSocket client — stream progress and save a GLB.
+"""TRELLIS.2 WebSocket client — stream progress and save a GLB or PNG.
 
 Modes:
     full     image -> textured GLB (default)
     mesh     image -> white GLB (geometry only, no UVs / texture)
     texture  image + input mesh -> textured GLB (re-texture an existing mesh)
+    rmbg     image -> PNG with background removed (no 3D generation)
 
 Example:
     python trellis2_client.py --image assets/example_image/T.png --output out.glb
     python trellis2_client.py --image in.png --mode mesh --output white.glb
     python trellis2_client.py --image in.png --mode texture --input-mesh model.glb --output textured.glb
+    python trellis2_client.py --image in.png --mode rmbg --output out.png
 
 Requires the ``websockets`` package.
 """
@@ -126,12 +128,19 @@ async def _run(args) -> None:
                     elif stage == "done":
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
-                        glb = await ws.recv()
+                        data = await ws.recv()
                         output_dir = os.path.dirname(os.path.abspath(args.output))
                         os.makedirs(output_dir, exist_ok=True)
-                        with open(args.output, "wb") as f:
-                            f.write(glb)
-                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        if args.mode == "rmbg":
+                            # For rmbg mode, ensure the output path ends with .png
+                            output_path = args.output
+                            if not output_path.lower().endswith(".png"):
+                                output_path = os.path.splitext(output_path)[0] + ".png"
+                        else:
+                            output_path = args.output
+                        with open(output_path, "wb") as f:
+                            f.write(data)
+                        print(f"[client] saved {len(data)} bytes -> {output_path}")
                         return
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
@@ -163,9 +172,10 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         default="full",
-        choices=["full", "mesh", "texture"],
+        choices=["full", "mesh", "texture", "rmbg"],
         help="full: textured GLB (default); mesh: white geometry only; "
-             "texture: re-texture --input-mesh with --image",
+             "texture: re-texture --input-mesh with --image; "
+             "rmbg: remove background, return PNG",
     )
     parser.add_argument(
         "--input-mesh",

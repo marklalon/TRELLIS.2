@@ -313,7 +313,8 @@ class GenParams(BaseModel):
     #   texture - image + input GLB -> textured GLB (re-texture an existing
     #             mesh; the client sends the GLB as a second binary frame).
     #             Texture is sampled at 1024 (the only resident texture model).
-    mode: Literal['full', 'mesh', 'texture'] = 'full'
+    #   rmbg    - image -> PNG with background removed (no 3D generation).
+    mode: Literal['full', 'mesh', 'texture', 'rmbg'] = 'full'
 
 
 def _load_pipeline():
@@ -826,6 +827,17 @@ async def _prewarm_flow_models_when_idle() -> None:
             logger.exception("flow-model prewarm failed")
 
 
+def _run_rembg(image: Image.Image) -> bytes:
+    """Run background removal only and return PNG bytes."""
+    rembg_model = state.pipeline.rembg_model
+    if rembg_model is None:
+        raise RuntimeError("Background removal model is not loaded")
+    result = rembg_model(image)
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _decode_image(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
@@ -901,13 +913,14 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     Protocol:
-      client -> {"seed": 42, "mode": "full"|"mesh"|"texture", ...params}  (JSON text frame)
+      client -> {"seed": 42, "mode": "full"|"mesh"|"texture"|"rmbg", ...params}  (JSON text frame)
       client -> <raw image bytes>               (binary frame)
       client -> <raw GLB bytes>                 (binary frame; only when mode="texture")
       client -> {"type": "cancel"}               (while generation is running)
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
       server -> {"stage": "done", "glb_size": N, ...}  (JSON text frame)
       server -> <raw GLB bytes>                 (binary frame)
+      server -> <raw PNG bytes>                 (binary frame; only when mode="rmbg")
     """
     request_id = uuid.uuid4().hex[:8]
     cancellation = None
@@ -925,6 +938,42 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
         params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields})
+
+        # rmbg mode: only remove background, return PNG. No pipeline needed.
+        if params.mode == 'rmbg':
+            try:
+                image_data = await ws.receive_bytes()
+                img = _decode_image(image_data)
+            except Exception as e:
+                logger.warning("[%s] invalid image: %s", request_id, e)
+                await ws.send_json({"stage": "error", "message": f"invalid image: {e}"})
+                await ws.close()
+                return
+
+            logger.info("[%s] rmbg request image=%s size=%sx%s mode=%s",
+                        request_id, len(image_data), img.width, img.height, img.mode)
+
+            await ws.send_json({
+                "stage": "queued", "queued": False, "request_id": request_id
+            })
+            await ws.send_json({"stage": "processing", "progress": 0, "request_id": request_id})
+
+            t0 = time.time()
+            png_bytes = await asyncio.to_thread(_run_rembg, img)
+
+            await ws.send_json({
+                "stage": "done",
+                "elapsed_sec": round(time.time() - t0, 2),
+                "progress": 100,
+                "request_id": request_id,
+                "glb_size": len(png_bytes),
+            })
+            await ws.send_bytes(png_bytes)
+            logger.info("[%s] rmbg request completed bytes=%d elapsed=%.2fs",
+                        request_id, len(png_bytes), time.time() - t0)
+            await ws.close()
+            return
+
         if params.mode == 'texture' and state.texturing_pipeline is None:
             logger.warning("[%s] rejected: texture mode unavailable", request_id)
             await ws.send_json({"stage": "error",
