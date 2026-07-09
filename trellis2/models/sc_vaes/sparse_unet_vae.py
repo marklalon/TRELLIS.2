@@ -1,11 +1,52 @@
 from typing import *
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
+from ...modules.utils import convert_module_to, convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+
+
+def _empty_cache_between_stages() -> bool:
+    """Switch: release freed-but-cached allocator blocks at each decode
+    resolution boundary. See ``TRELLIS2_DECODE_EMPTY_CACHE``.
+
+    An alternative to ``expandable_segments`` for taming the reserved-pool
+    growth across the decoder's upsample stages -- useful when expandable
+    segments are unstable on a given driver/WSL2 setup.
+    """
+    return (
+        os.environ.get("TRELLIS2_DECODE_EMPTY_CACHE", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        and torch.cuda.is_available()
+    )
+
+
+def _silu_maybe_inplace(feats: torch.Tensor) -> torch.Tensor:
+    """SiLU, done in place during inference to save a full-size activation copy.
+
+    Falls back to the out-of-place op whenever autograd is active so training is
+    numerically unaffected. The decode path runs under ``torch.no_grad`` (see
+    ``Trellis2ImageTo3DPipeline.decode_latent``), so the in-place branch is what
+    executes at the high-resolution VAE decode peak.
+    """
+    return F.silu(feats, inplace=not torch.is_grad_enabled())
+
+
+def _residual_add(h: sp.SparseTensor, skip: sp.SparseTensor) -> sp.SparseTensor:
+    """Add the skip connection into ``h`` in place during inference.
+
+    ``h`` is a freshly produced conv/mlp output that is not referenced elsewhere,
+    so mutating its features avoids allocating another full-size tensor for the
+    residual sum -- the dominant tensors at the finest decode resolution. Uses
+    the out-of-place op when grad is required to keep the autograd graph intact.
+    """
+    if torch.is_grad_enabled():
+        return h + skip
+    h.feats.add_(skip.feats)
+    return h
 
 
 class SparseResBlock3d(nn.Module):
@@ -68,7 +109,7 @@ class SparseResBlock3d(nn.Module):
         if self.upsample:
             subdiv = self.to_subdiv(x)
         h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         if self.resample_mode == 'spatial2channel':
             h = self.conv1(h)
         h = self._updown(h, subdiv)
@@ -76,9 +117,9 @@ class SparseResBlock3d(nn.Module):
         if self.resample_mode == 'nearest':
             h = self.conv1(h)
         h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual_add(h, self.skip_connection(x))
         if self.upsample:
             return h, subdiv
         return h
@@ -111,14 +152,14 @@ class SparseResBlockDownsample3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.updown(h)
         x = self.updown(x)
         h = self.conv1(h)
         h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual_add(h, self.skip_connection(x))
         return h
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -155,15 +196,15 @@ class SparseResBlockUpsample3d(nn.Module):
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
         h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
         h = self.conv1(h)
         h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual_add(h, self.skip_connection(x))
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -197,14 +238,14 @@ class SparseResBlockS2C3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv1(h)
         h = self.updown(h)
         x = self.updown(x)
         h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual_add(h, self.skip_connection(x))
         return h
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -241,15 +282,15 @@ class SparseResBlockC2S3d(nn.Module):
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
         h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
         h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_silu_maybe_inplace(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual_add(h, self.skip_connection(x))
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -285,7 +326,7 @@ class SparseConvNeXtBlock3d(nn.Module):
         h = self.conv(x)
         h = h.replace(self.norm(h.feats))
         h = h.replace(self.mlp(h.feats))
-        return h + x
+        return _residual_add(h, x)
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         if self.use_checkpoint:
@@ -465,6 +506,17 @@ class SparseUnetVaeDecoder(nn.Module):
         """
         self.blocks.apply(convert_module_to_f32)
 
+    def set_compute_dtype(self, dtype: torch.dtype) -> None:
+        """Switch the torso compute dtype at runtime (both the block weights and
+        the ``h.type(self.dtype)`` activation cast in ``forward``). The boundary
+        layers (``from_latent``/``output_layer``) are left untouched, so the
+        latent input and the decoded output keep their original dtype. Used by
+        the pipeline's optional fp16-decode switch to halve the decode-stage
+        activation footprint at the finest resolution.
+        """
+        self.dtype = dtype
+        self.blocks.apply(lambda m: convert_module_to(m, dtype))
+
     def initialize_weights(self) -> None:
         # Initialize transformer layers:
         def _basic_init(module):
@@ -482,9 +534,19 @@ class SparseUnetVaeDecoder(nn.Module):
         h = h.type(self.dtype)
         subs_gt = []
         subs = []
+        empty_cache = _empty_cache_between_stages() and not self.training
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    # Resolution boundary: the upsampling block below multiplies
+                    # the token count (e.g. 1.8M -> 7.7M at the finest stage).
+                    # Optionally hand the coarser stages' freed-but-still-cached
+                    # allocator blocks back to the driver first, so this large
+                    # allocation reuses that memory instead of growing the
+                    # reserved pool -- the fragmentation that dominates the
+                    # decode driver peak when expandable_segments is off.
+                    if empty_cache:
+                        torch.cuda.empty_cache()
                     if self.pred_subdiv:
                         if self.training:
                             subs_gt.append(h.get_spatial_cache('subdivision'))

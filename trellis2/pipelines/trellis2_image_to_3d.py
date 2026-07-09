@@ -136,6 +136,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             self._offload_mode = None
         self._offload = self._offload_mode is not None
+        # Optional fp16 VAE-decode switch (for quality A/B). The shape/texture
+        # decoder torsos otherwise run in their configured precision.
+        #   unset  - leave the decoders as loaded (no forced conversion).
+        #   "1"    - run the decoder torsos in fp16; roughly halves the decode
+        #            activation peak at the finest resolution.
+        #   "0"    - force the torsos to fp32 (full-precision baseline to compare
+        #            quality against). Boundary layers stay fp32 either way, so
+        #            the latent input and decoded output dtype are unchanged.
+        _fp16 = os.environ.get("TRELLIS2_DECODE_FP16", "").strip().lower()
+        if _fp16 in ("1", "true", "yes", "on"):
+            self._decode_fp16 = True
+        elif _fp16 in ("0", "false", "no", "off"):
+            self._decode_fp16 = False
+        else:
+            self._decode_fp16 = None
         # Flow-model keys the last request evicted before decode; "decode" mode
         # prewarms exactly these back onto the GPU after the request finishes.
         self._pending_prewarm: List[str] = []
@@ -237,8 +252,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         peak-VRAM decode, so they are the ones we page to CPU."""
         return 'flow' in model_key
 
+    def _apply_decode_precision(self) -> None:
+        """Force the shape/texture VAE decoder torsos to the fp16-decode switch's
+        dtype (a no-op when the switch is unset). See ``TRELLIS2_DECODE_FP16``."""
+        if self._decode_fp16 is None:
+            return
+        dtype = torch.float16 if self._decode_fp16 else torch.float32
+        changed = []
+        for key in ('shape_slat_decoder', 'tex_slat_decoder'):
+            model = self.models.get(key)
+            if isinstance(model, nn.Module) and hasattr(model, 'set_compute_dtype'):
+                model.set_compute_dtype(dtype)
+                changed.append(key)
+        if changed:
+            logger.info("VAE decode precision forced to %s (%s)",
+                        dtype, ", ".join(changed))
+
     def cuda(self) -> None:
         super().cuda()
+        self._apply_decode_precision()
         if self._offload:
             # Start the flow models on the CPU; _resident pages them in on demand.
             # decoders / image encoder stay resident.
