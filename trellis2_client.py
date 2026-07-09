@@ -91,6 +91,7 @@ async def _run(args) -> None:
         "preprocess_image": True,
     }
     payload["pipeline_type"] = args.pipeline_type
+    payload["tex_shape_slat"] = args.tex_shape_slat
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -193,6 +194,13 @@ def main() -> None:
         type=int,
         default=12,
         help="Shape SLat sampling steps (default: 12)",
+    )
+    parser.add_argument(
+        "--tex-shape-slat",
+        type=int,
+        default=512,
+        choices=[512, 1024],
+        help="Mesh shape encoding grid resolution in texture mode (512 or 1024; default: 512)",
     )
     parser.add_argument(
         "--simplify",

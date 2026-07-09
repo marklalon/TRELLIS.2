@@ -220,12 +220,18 @@ class _CancellationToken:
 
 
 @asynccontextmanager
-async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: _CancellationToken):
-    """Acquire a phase lock, but immediately remove cancelled queued work."""
+async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: _CancellationToken,
+                             lock_name: str = "lock"):
+    """Acquire a phase lock, but immediately remove cancelled queued work.
+
+    Logs acquisition and release of the lock so GPU lock contention is
+    observable in the server log.
+    """
     cancellation.raise_if_cancelled()
     acquire_task = asyncio.create_task(lock.acquire())
     cancel_task = asyncio.create_task(cancellation.wait())
     lock_held = False
+    acquire_start = time.monotonic()
     try:
         await asyncio.wait(
             (acquire_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
@@ -238,6 +244,8 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: _CancellationToke
         cancel_task.cancel()
         with suppress(asyncio.CancelledError):
             await cancel_task
+        logger.info("%s acquired after %.2fs", lock_name,
+                    time.monotonic() - acquire_start)
         yield
     finally:
         if not acquire_task.done():
@@ -253,6 +261,8 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: _CancellationToke
         with suppress(asyncio.CancelledError):
             await cancel_task
         if lock_held:
+            logger.info("%s released (held=%.2fs)", lock_name,
+                        time.monotonic() - acquire_start)
             lock.release()
 
 
@@ -295,6 +305,7 @@ class GenParams(BaseModel):
     preprocess_image: bool = True
     texture_sampling_steps: int = 12             # tex SLat sampling steps
     shape_sampling_steps: int = 12               # shape SLat sampling steps
+    tex_shape_slat: int = 512                    # mesh encoding grid resolution in texture mode
     alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
     # Generation mode:
     #   full    - image -> textured GLB (shape + texture; default).
@@ -394,8 +405,6 @@ def _init_texturing_pipeline() -> None:
             'tex_slat_decoder': pipeline.models['tex_slat_decoder'],
             'tex_slat_flow_model_1024': pipeline.models['tex_slat_flow_model_1024'],
         }
-        if 'tex_slat_flow_model_512' in pipeline.models:
-            tex.models['tex_slat_flow_model_512'] = pipeline.models['tex_slat_flow_model_512']
         tex.tex_slat_sampler = pipeline.tex_slat_sampler
         tex.tex_slat_sampler_params = pipeline.tex_slat_sampler_params
         tex.shape_slat_normalization = pipeline.shape_slat_normalization
@@ -404,6 +413,10 @@ def _init_texturing_pipeline() -> None:
         tex.rembg_model = pipeline.rembg_model
         tex.pbr_attr_layout = pipeline.pbr_attr_layout
         tex._device = 'cuda'
+        # Mirror the image-to-3D pipeline's offload state so texturing can page the
+        # tex_slat_decoder to CPU during shape encoding (its VRAM-peak stage) and
+        # bring it back only for decode. No-op when offload is disabled.
+        tex._offload = bool(getattr(pipeline, '_offload', False))
         state.texturing_pipeline = tex
         logger.info("Texturing pipeline ready (shares resident tex models + "
                     "shape encoder '%s')", SHAPE_ENCODER_REF)
@@ -455,6 +468,7 @@ class _ProgressReporter:
         self.progress_callback = progress_callback
         self.started_at = time.monotonic()
         self.last_report_at = self.started_at
+        self.last_logged_stage: Optional[str] = None
 
     def raise_if_cancelled(self) -> None:
         self.cancellation.raise_if_cancelled()
@@ -462,11 +476,17 @@ class _ProgressReporter:
     def report(self, percent: int, stage: str) -> None:
         self.raise_if_cancelled()
         now = time.monotonic()
-        delta = now - self.last_report_at
-        self.last_report_at = now
         elapsed = round(now - self.started_at, 2)
-        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
-                    self.request_id, percent, stage, elapsed, delta)
+        # Log only the first report of each stage. Intra-stage updates (per
+        # sampling step, per postprocess sub-step) still stream to the client but
+        # would otherwise flood the log with near-identical lines. ``delta`` then
+        # measures how long the previous stage took.
+        if stage != self.last_logged_stage:
+            delta = now - self.last_report_at
+            self.last_report_at = now
+            self.last_logged_stage = stage
+            logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
+                        self.request_id, percent, stage, elapsed, delta)
         if self.progress_callback is not None:
             self.progress_callback(percent, stage, elapsed)
         self.raise_if_cancelled()
@@ -475,7 +495,12 @@ class _ProgressReporter:
 def _ensure_tex_flow_resident() -> None:
     """Page the shared texture flow model back onto the GPU if CPU offload left
     it evicted. Texture-only sampling does not go through the offload-aware
-    ``_resident`` context, so it must be resident before we sample."""
+    ``_resident`` context, so it must be resident before we sample.
+
+    Called via the texturing pipeline's ``on_shape_encoded`` hook -- i.e. after
+    shape encoding, the peak-VRAM stage -- so the flow model's weights are not
+    resident during that peak (they would otherwise stack ~1.3B params on top of
+    the shape encoder's activations)."""
     pipeline = state.pipeline
     if pipeline is None or not getattr(pipeline, "_offload", False):
         return
@@ -500,10 +525,29 @@ def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
         raise RuntimeError(
             "texture-only mode is unavailable (texturing pipeline not loaded)"
         )
-    # The resident image-to-3D pipeline only loads the 1024 texture flow model,
-    # so texturing always runs at 1024.
-    _ensure_tex_flow_resident()
-    reporter.report(15, "encoding mesh and texturing")
+    # The shape encoding grid resolution is controlled by ``tex_shape_slat``
+    # (512 or 1024). Texture sampling always runs on tex_slat_flow_model_1024
+    # (the dedicated 512 texture model was dropped); the pipeline conditions at
+    # 1024 even when the shape is encoded at 512. The flow model is paged onto
+    # the GPU via the on_shape_encoded hook (after shape encoding, the peak-VRAM
+    # stage) rather than up front, so its weights don't inflate the encoder's
+    # activation peak.
+    def _evict_flow_before_decode() -> None:
+        # Page the texture flow model back to CPU *before* decode_tex_slat, exactly
+        # as the image-to-3D pipeline does before its own decode. The flow DiT is
+        # idle during decode, so leaving it resident just inflates the decode peak
+        # (the binding peak for texture-only). This also restores the offload
+        # baseline for the next request.
+        if getattr(state.pipeline, "_offload", False):
+            state.pipeline._evict_flow_models()
+
+    def pipeline_progress(percent: int, stage: str) -> None:
+        # The texturing pipeline's 0..100 internal progress spans the sampling
+        # phase's 15%..72% of the whole request (post-processing/export is the
+        # remaining tail). Mapping it here lets the client stream progress through
+        # shape encoding, per-step texture sampling and decode instead of stalling.
+        reporter.report(15 + round(percent * 0.57), stage)
+
     out = tex_pipeline.run(
         input_mesh,
         image,
@@ -513,14 +557,12 @@ def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
         preprocess_image=params.preprocess_image,
-        resolution=1024,
+        resolution=params.tex_shape_slat,
         texture_size=params.texture_size,
+        on_shape_encoded=_ensure_tex_flow_resident,
+        before_decode=_evict_flow_before_decode,
+        progress_callback=pipeline_progress,
     )
-    # Restore the offload baseline (evict the flow model back to CPU) so the next
-    # image-to-3D request's decode peak is unchanged.
-    if getattr(state.pipeline, "_offload", False):
-        state.pipeline._evict_flow_models()
-    reporter.report(72, "texture sampled")
     return out
 
 
@@ -700,13 +742,10 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
     reporter = _ProgressReporter(request_id, cancellation, progress_callback)
 
     with _VramPeakMonitor(request_id):
-        queued = state.sampling_lock.locked()
-        logger.info("[%s] queued=%s", request_id, queued)
         wait_started = time.monotonic()
-        async with _acquire_or_cancel(state.sampling_lock, cancellation):
+        async with _acquire_or_cancel(state.sampling_lock, cancellation,
+                                       lock_name=f"[{request_id}] sampling_lock"):
             state.busy = True
-            logger.info("[%s] sampling lock acquired after %.2fs", request_id,
-                        time.monotonic() - wait_started)
             try:
                 mesh = await _to_thread_cancellable(
                     _run_sampling, reporter, image, params, input_mesh,
@@ -717,7 +756,8 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
             if not OVERLAP_POSTPROCESS:
                 # Serial fallback: keep the sampling lock held through the whole
                 # post-processing tail so only one request uses the GPU at a time.
-                async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+                async with _acquire_or_cancel(state.postprocess_lock, cancellation,
+                                               lock_name=f"[{request_id}] postprocess_lock"):
                     data = await _to_thread_cancellable(
                         _run_postprocess, reporter, mesh, params,
                         cancellation=cancellation,
@@ -730,7 +770,8 @@ async def _generate(image: Image.Image, params: GenParams, request_id: str,
 
         # Overlap path: the sampling lock is released here; the next request can
         # sample while this one finishes post-processing under its own lock.
-        async with _acquire_or_cancel(state.postprocess_lock, cancellation):
+        async with _acquire_or_cancel(state.postprocess_lock, cancellation,
+                                       lock_name=f"[{request_id}] postprocess_lock"):
             data = await _to_thread_cancellable(
                 _run_postprocess, reporter, mesh, params, cancellation=cancellation
             )
@@ -796,7 +837,7 @@ def _decode_mesh(data: bytes):
     if isinstance(loaded, trimesh.Scene):
         if len(loaded.geometry) == 0:
             raise ValueError("no geometry found in uploaded GLB")
-        loaded = loaded.dump(concatenate=True)
+        loaded = loaded.to_geometry()
     if not hasattr(loaded, "vertices") or not hasattr(loaded, "faces"):
         raise ValueError("uploaded file did not contain a triangle mesh")
     return loaded
@@ -934,7 +975,6 @@ async def ws_generate(ws: WebSocket):
                 cancellation.cancel("WebSocket client disconnected")
 
         queued = state.sampling_lock.locked()
-        logger.info("[%s] queued=%s", request_id, queued)
         await ws.send_json({
             "stage": "queued", "queued": queued, "request_id": request_id
         })

@@ -31,7 +31,6 @@ class Trellis2TexturingPipeline(Pipeline):
     model_names_to_load = [
         'shape_slat_encoder',
         'tex_slat_decoder',
-        'tex_slat_flow_model_512',
         'tex_slat_flow_model_1024'
     ]
 
@@ -171,6 +170,7 @@ class Trellis2TexturingPipeline(Pipeline):
         self,
         mesh: trimesh.Trimesh,
         resolution: int = 1024,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> SparseTensor:
         """
         Encode the meshes to structured latent.
@@ -178,13 +178,22 @@ class Trellis2TexturingPipeline(Pipeline):
         Args:
             mesh (trimesh.Trimesh): The mesh to encode.
             resolution (int): The resolution of mesh
-        
+            progress_callback (callable): Optional ``(percent, stage)`` callback on a
+                0..100 scale so the caller can stream sub-progress through the two
+                heavy steps (dual-grid conversion, then the encoder forward) instead
+                of stalling on a single "encoding mesh" report.
+
         Returns:
             SparseTensor: The encoded structured latent.
         """
+        def report(percent: int, stage: str) -> None:
+            if progress_callback is not None:
+                progress_callback(percent, stage)
+
         vertices = torch.from_numpy(mesh.vertices).float()
         faces = torch.from_numpy(mesh.faces).long()
-        
+
+        report(0, "converting mesh to dual grid")
         voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
             vertices.cpu(), faces.cpu(),
             grid_size=resolution,
@@ -192,9 +201,10 @@ class Trellis2TexturingPipeline(Pipeline):
             face_weight=1.0,
             boundary_weight=0.2,
             regularization_weight=1e-2,
-            timing=True,
+            timing=False,
         )
-            
+
+        report(70, "encoding shape latent")
         vertices = SparseTensor(
             feats=dual_vertices * resolution - voxel_indices,
             coords=torch.cat([torch.zeros_like(voxel_indices[:, 0:1]), voxel_indices], dim=-1)
@@ -210,14 +220,17 @@ class Trellis2TexturingPipeline(Pipeline):
         flow_model,
         shape_slat: SparseTensor,
         sampler_params: dict = {},
+        step_callback: Optional[Callable[[int, int], None]] = None,
     ) -> SparseTensor:
         """
         Sample structured latent with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             shape_slat (SparseTensor): The structured latent for shape
             sampler_params (dict): Additional parameters for the sampler.
+            step_callback (callable): Optional ``(completed_steps, total_steps)``
+                callback fired after each sampling step, for progress reporting.
         """
         # Sample structured latent
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
@@ -233,8 +246,9 @@ class Trellis2TexturingPipeline(Pipeline):
             concat_cond=shape_slat,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=False,
             tqdm_desc="Sampling texture SLat",
+            step_callback=step_callback,
         ).samples
 
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
@@ -265,12 +279,18 @@ class Trellis2TexturingPipeline(Pipeline):
         pbr_voxel: SparseTensor,
         resolution: int = 1024,
         texture_size: int = 1024,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> trimesh.Trimesh:
+        def report(percent: int, stage: str) -> None:
+            if progress_callback is not None:
+                progress_callback(percent, stage)
+
         vertices = mesh.vertices
         faces = mesh.faces
         normals = mesh.vertex_normals
         vertices_torch = torch.from_numpy(vertices).float().cuda()
         faces_torch = torch.from_numpy(faces).int().cuda()
+        report(0, "unwrapping UVs")
         if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
             uvs = mesh.visual.uv.copy()
             uvs[:, 1] = 1 - uvs[:, 1]
@@ -296,6 +316,7 @@ class Trellis2TexturingPipeline(Pipeline):
             normals = cu_normals[vmap.to(cu_normals.device)].cpu().numpy()
                 
         # rasterize
+        report(30, "rasterizing texture")
         ctx = dr.RasterizeCudaContext()
         uvs_torch = torch.cat([uvs_torch * 2 - 1, torch.zeros_like(uvs_torch[:, :1]), torch.ones_like(uvs_torch[:, :1])], dim=-1).unsqueeze(0)
         rast, _ = dr.rasterize(
@@ -305,6 +326,7 @@ class Trellis2TexturingPipeline(Pipeline):
         mask = rast[0, ..., 3] > 0
         pos = dr.interpolate(vertices_torch.unsqueeze(0), rast, faces_torch)[0][0]
         
+        report(50, "sampling texture voxels")
         attrs = torch.zeros(texture_size, texture_size, pbr_voxel.shape[1], device=self.device)
         attrs[mask] = flex_gemm.ops.grid_sample.grid_sample_3d(
             pbr_voxel.feats,
@@ -322,12 +344,14 @@ class Trellis2TexturingPipeline(Pipeline):
         alpha = np.clip(attrs[..., self.pbr_attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         
         # extend
+        report(70, "inpainting texture")
         mask = (~mask).astype(np.uint8)
         base_color = cv2.inpaint(base_color, mask, 3, cv2.INPAINT_TELEA)
         metallic = cv2.inpaint(metallic, mask, 1, cv2.INPAINT_TELEA)[..., None]
         roughness = cv2.inpaint(roughness, mask, 1, cv2.INPAINT_TELEA)[..., None]
         alpha = cv2.inpaint(alpha, mask, 1, cv2.INPAINT_TELEA)[..., None]
         
+        report(95, "assembling textured mesh")
         material = trimesh.visual.material.PBRMaterial(
             baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
@@ -364,6 +388,9 @@ class Trellis2TexturingPipeline(Pipeline):
         preprocess_image: bool = True,
         resolution: int = 1024,
         texture_size: int = 2048,
+        on_shape_encoded: Optional[Callable[[], None]] = None,
+        before_decode: Optional[Callable[[], None]] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> trimesh.Trimesh:
         """
         Run the pipeline.
@@ -374,18 +401,103 @@ class Trellis2TexturingPipeline(Pipeline):
             seed (int): The random seed.
             tex_slat_sampler_params (dict): Additional parameters for the texture latent sampler.
             preprocess_image (bool): Whether to preprocess the image.
+            on_shape_encoded (callable): Optional hook fired after ``encode_shape_slat``
+                and before texture sampling. The caller uses it to page the texture
+                flow model onto the GPU only once shape encoding (the VRAM-peak stage)
+                is done, so the flow weights don't inflate the encoder's activation peak.
+            before_decode (callable): Optional hook fired after texture sampling and
+                before ``decode_tex_slat``. The caller uses it to page the texture flow
+                model back to CPU so its weights don't inflate the decode peak (the
+                binding peak for texture-only), mirroring the image-to-3D decode path.
+            progress_callback (callable): Optional ``(percent, stage)`` callback on a
+                0..100 scale, reported at each stage boundary and per sampling step so
+                the caller can stream progress instead of stalling through the ~12s of
+                shape encoding, texture sampling and decode.
         """
+        def report(percent: int, stage: str) -> None:
+            if progress_callback is not None:
+                progress_callback(percent, stage)
+
+        def report_encode(percent: int, stage: str) -> None:
+            # Shape encoding occupies the 15..25 band of the run.
+            report(15 + round(percent * 0.10), stage)
+
+        def report_sampling_step(completed: int, total: int) -> None:
+            # Texture sampling occupies the 25..55 band of the run.
+            report(25 + round(completed / max(total, 1) * 30), "sampling texture")
+
+        def report_postprocess(percent: int, stage: str) -> None:
+            # postprocess_mesh (UV unwrap, rasterize, grid-sample, inpaint) is the
+            # long pole of texture-only, so give it a wide 62..98 band with internal
+            # steps instead of freezing the client on a single "decoding" report.
+            report(62 + round(percent * 0.36), stage)
+
+        report(0, "starting texture pipeline")
         if preprocess_image:
+            report(3, "preprocessing image")
             image = self.preprocess_image(image)
         mesh = self.preprocess_mesh(mesh)
         torch.manual_seed(seed)
-        cond = self.get_cond([image], 512) if resolution == 512 else self.get_cond([image], 1024)
-        shape_slat = self.encode_shape_slat(mesh, resolution)
-        tex_model = self.models['tex_slat_flow_model_512'] if resolution == 512 else self.models['tex_slat_flow_model_1024']
-        tex_slat = self.sample_tex_slat(
-            cond, tex_model,
-            shape_slat, tex_slat_sampler_params
-        )
-        pbr_voxel = self.decode_tex_slat(tex_slat)
-        out_mesh = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
-        return out_mesh
+        # Texture sampling always runs on tex_slat_flow_model_1024 (the dedicated
+        # 512 texture model was dropped), so condition at 1024 -- its training
+        # distribution -- even when the shape is encoded at 512. RoPE PE handles
+        # the 512 shape's smaller coordinate range. Mirrors the image-to-3D 512
+        # path (see Trellis2ImageTo3DPipeline.run).
+        report(8, "encoding image conditions")
+        cond = self.get_cond([image], 1024)
+        # The tex_slat_decoder is only needed for decode_tex_slat, well past the
+        # shape-encoding VRAM peak. Under CPU offload, page it out so its weights
+        # don't inflate that peak; it is restored just before decode below.
+        decoder = self.models.get('tex_slat_decoder')
+        evict_decoder = getattr(self, '_offload', False) and isinstance(decoder, nn.Module)
+        if evict_decoder:
+            decoder.cpu()
+            torch.cuda.empty_cache()
+        try:
+            shape_slat = self.encode_shape_slat(
+                mesh, resolution, progress_callback=report_encode
+            )
+            # Return the encoder's transient activations to the driver before the
+            # flow model pages in and sampling/decode allocate. Only shape_slat
+            # survives encoding, so the freed blocks are pure reserved-pool slack;
+            # releasing them here keeps the later stages from stacking on top of
+            # (and fragmenting against) the encoder's high-water. Mirrors the
+            # decode-boundary empty_cache the image-to-3D path uses.
+            if evict_decoder:
+                torch.cuda.empty_cache()
+            # Shape encoding is the peak-VRAM stage; page the texture flow model in
+            # only now (see on_shape_encoded above) so its weights don't stack on
+            # that peak.
+            if on_shape_encoded is not None:
+                on_shape_encoded()
+            report(25, "sampling texture")
+            tex_model = self.models['tex_slat_flow_model_1024']
+            tex_slat = self.sample_tex_slat(
+                cond, tex_model,
+                shape_slat, tex_slat_sampler_params,
+                step_callback=report_sampling_step,
+            )
+            # Evict the flow model (idle now) before decode, then release its freed
+            # blocks, so decode -- the binding peak -- runs without the flow weights
+            # or the sampling scratch resident. Order matters: free the flow DiT
+            # first, then bring the decoder back into the reclaimed space.
+            if before_decode is not None:
+                before_decode()
+            if evict_decoder:
+                torch.cuda.empty_cache()
+                decoder.to(self._device)
+                evict_decoder = False  # restored; skip the finally fallback
+            report(58, "decoding texture")
+            pbr_voxel = self.decode_tex_slat(tex_slat)
+            out_mesh = self.postprocess_mesh(
+                mesh, pbr_voxel, resolution, texture_size,
+                progress_callback=report_postprocess,
+            )
+            report(100, "texture sampled")
+            return out_mesh
+        finally:
+            # The image-to-3D pipeline assumes tex_slat_decoder is always resident
+            # (it is not offloadable there), so never leave it stranded on the CPU
+            # if we bail out early (e.g. a cancelled sampling step).
+            if evict_decoder:
+                decoder.to(self._device)

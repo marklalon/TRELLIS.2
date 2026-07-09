@@ -94,11 +94,12 @@ class FlowEulerSampler(Sampler):
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
         cancellation_callback: Optional[Callable[[], None]] = None,
+        step_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -109,6 +110,8 @@ class FlowEulerSampler(Sampler):
             tqdm_desc: A customized tqdm desc.
             cancellation_callback: Optional check run before and after every
                 sampling step. It may raise to stop sampling cooperatively.
+            step_callback: Optional ``(completed_steps, total_steps)`` callback
+                fired after each completed step, for progress reporting.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -123,7 +126,7 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+        for i, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
             if cancellation_callback is not None:
                 cancellation_callback()
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
@@ -132,6 +135,8 @@ class FlowEulerSampler(Sampler):
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
+            if step_callback is not None:
+                step_callback(i + 1, steps)
         ret.samples = sample
         return ret
 
