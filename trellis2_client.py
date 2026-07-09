@@ -90,6 +90,7 @@ async def _run(args) -> None:
         "texture_sampling_steps": args.texture_sampling_steps,
         "shape_sampling_steps": args.shape_sampling_steps,
         "alpha_mode": args.alpha_mode,
+        "smooth_by_angle": args.smooth_by_angle,
     }
     payload["pipeline_type"] = args.pipeline_type
     payload["tex_shape_slat"] = args.tex_shape_slat
@@ -223,6 +224,16 @@ def main() -> None:
         default='OPAQUE',
         choices=['OPAQUE', 'MASK', 'BLEND'],
         help="Alpha mode for PBR material (default: OPAQUE)",
+    )
+    parser.add_argument(
+        "--smooth-by-angle",
+        nargs="?",
+        const=30.0,
+        type=float,
+        default=None,
+        help="Split hard edges before UV unwrap (default angle: 30 deg). "
+             "Usage: --smooth-by-angle (uses 30 deg) or --smooth-by-angle 45. "
+             "Omit to disable smoothing.",
     )
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

@@ -306,6 +306,7 @@ class GenParams(BaseModel):
     shape_sampling_steps: int = 12               # shape SLat sampling steps
     tex_shape_slat: int = 512                    # mesh encoding grid resolution in texture mode
     alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
+    smooth_by_angle: Optional[float] = None       # None=off, float=angle threshold for edge splitting
     # Generation mode:
     #   full    - image -> textured GLB (shape + texture; default).
     #   mesh    - image -> white GLB (shape only, no UVs, no texture).
@@ -656,6 +657,8 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
         decimation_target=params.decimation_target,
         texture_size=params.texture_size,
         alpha_mode=params.alpha_mode,
+        smooth_by_angle=params.smooth_by_angle is not None,
+        smooth_angle_deg=params.smooth_by_angle if params.smooth_by_angle is not None else 30.0,
         geometry_only=geometry_only,
         remesh=True,
         remesh_band=1,

@@ -113,6 +113,116 @@ def _pad_uv_seams(img: np.ndarray, valid: np.ndarray, iterations: int = 8) -> np
     return out.clip(0, 255).astype(np.uint8)
 
 
+def _edge_split_by_angle(
+    vertices: np.ndarray, faces: np.ndarray, angle_rad: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split vertices along edges sharper than ``angle_rad``.
+
+    Reproduces Blender's "Shade Smooth by Angle" (auto-smooth) with the
+    *Ignore Sharpness* option: which edges are hard is decided purely from the
+    geometric face-to-face angle, ignoring any sharp-edge marks. After the
+    split, plain smooth vertex-normal averaging yields flat shading across the
+    split (hard) edges and smooth shading everywhere else -- the glTF-bakeable
+    equivalent of custom split normals, since glTF stores baked per-vertex
+    normals rather than an abstract smoothing angle.
+
+    Faces that meet across a *smooth* edge keep sharing a vertex; faces that
+    meet across a *sharp* edge (or a boundary / non-manifold edge) get their own
+    copy of the shared vertex.
+
+    Args:
+        vertices: (V, 3) float array of vertex positions.
+        faces: (F, 3) int array of triangle vertex indices.
+        angle_rad: edges whose dihedral angle exceeds this are split.
+
+    Returns:
+        ``(new_vertices, new_faces)`` with coincident-position vertices
+        duplicated at hard edges. Face count and winding are unchanged.
+    """
+    V = int(vertices.shape[0])
+    F = int(faces.shape[0])
+    if F == 0:
+        return vertices, faces
+
+    # Per-face unit normals.
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)
+    fn /= np.linalg.norm(fn, axis=1, keepdims=True) + 1e-20
+
+    # Each (face, corner) is a node; smooth edges union the two corners they
+    # share at each endpoint. Corner id of face f local vertex k is 3*f + k.
+    parent = np.arange(3 * F, dtype=np.int64)
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Enumerate every face's three edges as undirected (lo, hi) endpoints,
+    # tracking which corner sits at the lo end and which at the hi end.
+    fi = np.arange(F)
+    lo_l, hi_l, clo_l, chi_l, face_l = [], [], [], [], []
+    for e in range(3):
+        a = faces[:, e]
+        b = faces[:, (e + 1) % 3]
+        ca = 3 * fi + e
+        cb = 3 * fi + (e + 1) % 3
+        a_is_lo = a <= b
+        lo_l.append(np.where(a_is_lo, a, b))
+        hi_l.append(np.where(a_is_lo, b, a))
+        clo_l.append(np.where(a_is_lo, ca, cb))
+        chi_l.append(np.where(a_is_lo, cb, ca))
+        face_l.append(fi)
+    lo = np.concatenate(lo_l)
+    hi = np.concatenate(hi_l)
+    clo = np.concatenate(clo_l)
+    chi = np.concatenate(chi_l)
+    efaces = np.concatenate(face_l)
+
+    # Group half-edges by undirected edge key; only manifold edges (exactly two
+    # incident faces) can be smoothed across. Sorting makes groups contiguous.
+    key = lo.astype(np.int64) * V + hi.astype(np.int64)
+    order = np.argsort(key, kind="stable")
+    key_s = key[order]
+    change = np.empty(key_s.shape[0], dtype=bool)
+    change[0] = True
+    change[1:] = key_s[1:] != key_s[:-1]
+    group_start = np.flatnonzero(change)
+    group_len = np.diff(np.append(group_start, key_s.shape[0]))
+    manifold = group_start[group_len == 2]
+    i0 = order[manifold]
+    i1 = order[manifold + 1]
+
+    # Smooth where the angle between the two face normals is within threshold.
+    cos_thr = float(np.cos(angle_rad))
+    dot = np.einsum("ij,ij->i", fn[efaces[i0]], fn[efaces[i1]])
+    smooth = dot >= cos_thr
+    si0, si1 = i0[smooth], i1[smooth]
+
+    for a, b in zip(clo[si0].tolist(), clo[si1].tolist()):
+        union(a, b)
+    for a, b in zip(chi[si0].tolist(), chi[si1].tolist()):
+        union(a, b)
+
+    # Compact corner roots into new vertex ids.
+    roots = np.array([find(c) for c in range(3 * F)], dtype=np.int64)
+    uniq, inv = np.unique(roots, return_inverse=True)
+    new_faces = inv.reshape(F, 3).astype(faces.dtype, copy=False)
+    corner_vertex = faces.reshape(-1)
+    new_vertices = vertices[corner_vertex[uniq]]
+    return new_vertices, new_faces
+
+
 def to_glb(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -131,6 +241,8 @@ def to_glb(
     mesh_cluster_refine_iterations=0,
     mesh_cluster_global_iterations=1,
     mesh_cluster_smooth_strength=1,
+    smooth_by_angle: bool = False,
+    smooth_angle_deg: float = 30.0,
     alpha_mode: str = 'OPAQUE',
     geometry_only: bool = False,
     verbose: bool = False,
@@ -159,6 +271,11 @@ def to_glb(
         mesh_cluster_refine_iterations: number of iterations for refining clusters in uv unwrapping
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
         mesh_cluster_smooth_strength: strength of smoothing for clustering in uv unwrapping
+        smooth_by_angle: if True, split vertices along edges sharper than
+            ``smooth_angle_deg`` before UV unwrap so the exported normals match
+            Blender's "Shade Smooth by Angle" (ignore sharpness). Off by default.
+        smooth_angle_deg: dihedral-angle threshold in degrees for
+            ``smooth_by_angle`` (Blender default 30).
         alpha_mode: glTF alpha mode - 'OPAQUE', 'MASK', or 'BLEND'
         geometry_only: if True, skip UV unwrapping and texture baking and return
             a plain (white, UV-less) mesh after remeshing/simplification/cleanup.
@@ -333,6 +450,32 @@ def to_glb(
         pbar.update(1)
     if verbose:
         print("Done")
+
+    # --- Optional Smooth-by-Angle (Blender "Shade Smooth by Angle", ignore
+    # sharpness) ---
+    # Split vertices along edges sharper than the threshold so that the smooth
+    # vertex-normal averaging done later reproduces auto-smooth shading: flat
+    # across creases, smooth elsewhere. Done here on the welded, decimated mesh
+    # -- before UV unwrap -- so smoothing groups follow true geometry and the
+    # new hard edges naturally fall on UV seams. Benefits both the geometry-only
+    # (white) and textured outputs, which read normals from this mesh.
+    if smooth_by_angle:
+        report(52, "smoothing by angle")
+        sv, sf = mesh.read()
+        sf_np = sf.detach().cpu().numpy()
+        nsv, nsf = _edge_split_by_angle(
+            sv.detach().cpu().numpy(),
+            sf_np.astype(np.int64),
+            np.radians(smooth_angle_deg),
+        )
+        mesh.init(
+            torch.from_numpy(np.ascontiguousarray(nsv, dtype=np.float32)).cuda(),
+            torch.from_numpy(np.ascontiguousarray(nsf.astype(sf_np.dtype))).cuda(),
+        )
+        if verbose:
+            print(f"After smooth-by-angle split: {mesh.num_vertices} vertices, "
+                  f"{mesh.num_faces} faces")
+        _log_vram("after smooth_by_angle")
 
     # --- Geometry-only (white mesh) short-circuit ---
     # Skip UV unwrapping and texture baking entirely: return a plain mesh with
