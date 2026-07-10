@@ -335,7 +335,15 @@ def to_glb(
     # Move data to GPU
     vertices = vertices.cuda()
     faces = faces.cuda()
-    
+
+    # Hand PyTorch's reserved-but-unused blocks back to the driver on entry. The
+    # decode-stage reserved pool is idle by now, and the heavy consumers here
+    # (cuBVH, remesh_narrow_band_dc) allocate via raw cudaMalloc outside torch's
+    # allocator, so returning the idle pool keeps them from competing with it.
+    # Complements the per-boundary empty_cache during decode and expandable_segments.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     _log_vram("to_glb:entry")
 
     # Initialize CUDA mesh handler

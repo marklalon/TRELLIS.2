@@ -251,9 +251,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
     @staticmethod
     def _is_offloadable(model_key: str) -> bool:
-        """The big flow DiTs are used one stage at a time and sit idle during the
-        peak-VRAM decode, so they are the ones we page to CPU."""
-        return 'flow' in model_key
+        """Models used in a single early stage that then sit idle through the
+        peak-VRAM decode, so they are the ones we page to CPU: the big flow DiTs
+        (one sampling stage each) plus the sparse-structure decoder (runs only
+        during sparse-structure sampling, before shape/texture sampling)."""
+        return 'flow' in model_key or model_key == 'sparse_structure_decoder'
 
     def cuda(self) -> None:
         super().cuda()
@@ -310,7 +312,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if moved:
             self._pending_prewarm = moved
             torch.cuda.empty_cache()
-            logger.info("evicted flow models to CPU before decode (%s)",
+            logger.info("evicted idle models to CPU before decode (%s)",
                         ", ".join(moved))
 
     def prewarm_flow_models(self) -> None:
@@ -427,9 +429,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 step_callback=step_callback,
             ).samples
 
-        # Decode sparse structure latent
+        # Decode sparse structure latent. Wrapped in ``_resident`` so that when it
+        # is offloaded (it now counts as offloadable) stage mode pages it onto the
+        # GPU only for this forward and back off afterwards, and so it survives the
+        # CPU-start that ``cuda()`` applies to offloadable models in stage mode.
         decoder = self.models['sparse_structure_decoder']
-        decoded = decoder(z_s)>0
+        with self._resident(decoder):
+            decoded = decoder(z_s)>0
         if resolution != decoded.shape[2]:
             ratio = decoded.shape[2] // resolution
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5

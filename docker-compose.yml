@@ -33,18 +33,14 @@ services:
       # PCIe transfer). Leave 0 on large-VRAM cards.
       - TRELLIS2_OFFLOAD=decode
       # Release freed-but-cached allocator blocks at each VAE-decode resolution
-      # boundary (before every upsample stage, incl. the res3 C2S that grows the
-      # token count ~1.8M -> 7.7M). Tames the reserved-pool fragmentation that
-      # dominates the decode driver peak, as an alternative to expandable_segments
-      # (a few empty_cache syncs per request). Set to 0 to disable.
+      # boundary. Set to 0 to disable.
       - TRELLIS2_DECODE_EMPTY_CACHE=1
       # Cap remesh resolution, reduce remesh_narrow_band_dc VM usage.
       - OVOXEL_REMESH_MAX_RES=512
       - OVOXEL_VRAM_LOG=1
       - TRELLIS2_MEM_FRACTION=0.2
       # expandable_segments repurposes freed blocks across the decoder's growing
-      # upsample stages but proved unstable here, so it is off; the empty_cache
-      # switch above handles the fragmentation instead. Flip back to :True to A/B.
+      # upsample stages.
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     volumes:
       # Mount the project source code (read-write for development)
