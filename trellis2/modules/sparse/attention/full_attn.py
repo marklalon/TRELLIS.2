@@ -31,6 +31,46 @@ def _get_cu_seqlens(seqlens: List[int], device: torch.device) -> torch.Tensor:
     return cached
 
 
+def _pack_varlen_for_sdpa(feats: torch.Tensor, seqlens: List[int], max_seqlen: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    lengths = torch.tensor(seqlens, dtype=torch.long, device=feats.device)
+    positions = torch.arange(max_seqlen, device=feats.device).unsqueeze(0)
+    mask = positions < lengths.unsqueeze(1)
+    dense = feats.new_zeros(len(seqlens), max_seqlen, *feats.shape[1:])
+    dense[mask] = feats
+    return dense, mask
+
+
+def _sdpa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_seqlen: List[int],
+    kv_seqlen: List[int],
+    force_cudnn: bool = False,
+) -> torch.Tensor:
+    if 'sdpa' not in globals():
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+
+    max_q_seqlen = max(q_seqlen)
+    max_kv_seqlen = max(kv_seqlen)
+    q, q_mask = _pack_varlen_for_sdpa(q, q_seqlen, max_q_seqlen)
+    k, kv_mask = _pack_varlen_for_sdpa(k, kv_seqlen, max_kv_seqlen)
+    v, _ = _pack_varlen_for_sdpa(v, kv_seqlen, max_kv_seqlen)
+
+    q = q.permute(0, 2, 1, 3)   # [N, H, L, C]
+    k = k.permute(0, 2, 1, 3)   # [N, H, L, C]
+    v = v.permute(0, 2, 1, 3)   # [N, H, L, C]
+    attn_mask = kv_mask[:, None, None, :]
+    if force_cudnn:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            out = sdpa(q, k, v, attn_mask=attn_mask)
+    else:
+        out = sdpa(q, k, v, attn_mask=attn_mask)
+    out = out.permute(0, 2, 1, 3)   # [N, L, H, C]
+    return out[q_mask]
+
+
 @overload
 def sparse_scaled_dot_product_attention(qkv: VarLenTensor) -> VarLenTensor:
     """
@@ -233,6 +273,12 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out = flash_attn_3.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
+    elif config.ATTN in ['sdpa', 'cudnn_sdpa']:
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        out = _sdpa_varlen(q, k, v, q_seqlen, kv_seqlen, force_cudnn=config.ATTN == 'cudnn_sdpa')
     else:
         raise ValueError(f"Unknown attention module: {config.ATTN}")
     

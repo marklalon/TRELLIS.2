@@ -3,6 +3,7 @@ import torch
 import math
 from .. import SparseTensor
 from .. import config
+from .full_attn import _sdpa_varlen
 
 
 __all__ = [
@@ -60,6 +61,10 @@ def calc_window_partition(
             'cu_seqlens': torch.cat([torch.tensor([0], device=tensor.device), torch.cumsum(seq_lens, dim=0)], dim=0).int(),
             'max_seqlen': torch.max(seq_lens)
         }
+    elif config.ATTN in ['sdpa', 'cudnn_sdpa']:
+        attn_func_args = {}
+    else:
+        raise ValueError(f"Unknown attention module: {config.ATTN}")
 
     return fwd_indices, bwd_indices, seq_lens, attn_func_args
     
@@ -113,6 +118,12 @@ def sparse_windowed_scaled_dot_product_self_attention(
         if 'flash_attn' not in globals():
             import flash_attn
         out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, **attn_func_args)  # [M, H, C]
+    elif config.ATTN in ['sdpa', 'cudnn_sdpa']:
+        q, k, v = qkv_feats.unbind(dim=1)
+        seq_lens = seq_lens.tolist()
+        out = _sdpa_varlen(q, k, v, seq_lens, seq_lens, force_cudnn=config.ATTN == 'cudnn_sdpa')  # [M, H, C]
+    else:
+        raise ValueError(f"Unknown attention module: {config.ATTN}")
 
     out = out[bwd_indices]      # [T, H, C]
 
@@ -184,6 +195,11 @@ def sparse_windowed_scaled_dot_product_cross_attention(
             cu_seqlens_q=q_attn_func_args['cu_seqlens'], cu_seqlens_k=kv_attn_func_args['cu_seqlens'],
             max_seqlen_q=q_attn_func_args['max_seqlen'], max_seqlen_k=kv_attn_func_args['max_seqlen'],
         )  # [M, H, C]
+    elif config.ATTN in ['sdpa', 'cudnn_sdpa']:
+        k, v = kv_feats.unbind(dim=1)
+        out = _sdpa_varlen(q_feats, k, v, q_seq_lens.tolist(), kv_seq_lens.tolist(), force_cudnn=config.ATTN == 'cudnn_sdpa')  # [M, H, C]
+    else:
+        raise ValueError(f"Unknown attention module: {config.ATTN}")
 
     out = out[q_bwd_indices]      # [T, H, C]
 

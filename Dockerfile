@@ -147,7 +147,7 @@ RUN find /usr/local/lib/python3.11/dist-packages -depth -type d -name '__pycache
 # ---- Environment variables ----
 ENV OPENCV_IO_ENABLE_OPENEXR=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    ATTN_BACKEND=flash-attn
+    ATTN_BACKEND=cudnn_sdpa
 
 # ---- Entrypoint script ----
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
