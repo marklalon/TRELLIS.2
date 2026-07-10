@@ -65,6 +65,14 @@ DEFAULT_PIPELINE = os.environ.get("TRELLIS2_PIPELINE", "512")
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("TRELLIS2_STARTUP_HEARTBEAT_SEC", "15"))
 )
+# Timeout for each individual `await ws.receive_*()` call (idle timeout).
+# If the client pauses between sending JSON params, image, and mesh (texture
+# mode), this timer resets after each successfully received message.
+RECV_IDLE_TIMEOUT = float(os.environ.get("TRELLIS2_RECV_IDLE_TIMEOUT", "10"))
+# Hard ceiling on the total time a WebSocket connection may spend in the
+# input-receiving phase (before generation starts). Measured from
+# ``ws.accept()``. A client that connects but never sends data hits this.
+WS_TOTAL_TIMEOUT = float(os.environ.get("TRELLIS2_WS_TOTAL_TIMEOUT", "120"))
 # Overlap one request's GPU-light post-processing with the next request's
 # sampling. Set to 0 to fall back to fully serial generation (e.g. if VRAM is
 # too tight to keep one finished mesh resident while another request samples).
@@ -929,10 +937,24 @@ async def ws_generate(ws: WebSocket):
     generation_task = None
     receiver_task = None
     await ws.accept()
+    _ws_started_at = time.monotonic()
     logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
     try:
-        raw = await ws.receive_text()
-        req = json.loads(raw)
+        try:
+            if time.monotonic() - _ws_started_at >= WS_TOTAL_TIMEOUT:
+                raise asyncio.TimeoutError("total connection timeout")
+            raw = await asyncio.wait_for(ws.receive_text(), timeout=RECV_IDLE_TIMEOUT)
+            req = json.loads(raw)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] receive params timed out", request_id)
+            await ws.send_json({"stage": "error", "message": "receive params timed out"})
+            await ws.close()
+            return
+        except Exception as e:
+            logger.warning("[%s] invalid params: %s", request_id, e)
+            await ws.send_json({"stage": "error", "message": f"invalid params: {e}"})
+            await ws.close()
+            return
         logger.info("[%s] WebSocket generation request received", request_id)
         if not state.ready:
             logger.warning("[%s] rejected: model still loading", request_id)
@@ -944,8 +966,15 @@ async def ws_generate(ws: WebSocket):
         # rmbg mode: only remove background, return PNG. No pipeline needed.
         if params.mode == 'rmbg':
             try:
-                image_data = await ws.receive_bytes()
+                if time.monotonic() - _ws_started_at >= WS_TOTAL_TIMEOUT:
+                    raise asyncio.TimeoutError("total connection timeout")
+                image_data = await asyncio.wait_for(ws.receive_bytes(), timeout=RECV_IDLE_TIMEOUT)
                 img = _decode_image(image_data)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] rmbg receive timed out", request_id)
+                await ws.send_json({"stage": "error", "message": "receive timed out"})
+                await ws.close()
+                return
             except Exception as e:
                 logger.warning("[%s] invalid image: %s", request_id, e)
                 await ws.send_json({"stage": "error", "message": f"invalid image: {e}"})
@@ -983,8 +1012,15 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
         try:
-            image_data = await ws.receive_bytes()
+            if time.monotonic() - _ws_started_at >= WS_TOTAL_TIMEOUT:
+                raise asyncio.TimeoutError("total connection timeout")
+            image_data = await asyncio.wait_for(ws.receive_bytes(), timeout=RECV_IDLE_TIMEOUT)
             img = _decode_image(image_data)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] image receive timed out", request_id)
+            await ws.send_json({"stage": "error", "message": "image receive timed out"})
+            await ws.close()
+            return
         except Exception as e:
             logger.warning("[%s] invalid image: %s", request_id, e)
             await ws.send_json({"stage": "error", "message": f"invalid image: {e}"})
@@ -994,8 +1030,15 @@ async def ws_generate(ws: WebSocket):
         input_mesh = None
         if params.mode == 'texture':
             try:
-                mesh_data = await ws.receive_bytes()
+                if time.monotonic() - _ws_started_at >= WS_TOTAL_TIMEOUT:
+                    raise asyncio.TimeoutError("total connection timeout")
+                mesh_data = await asyncio.wait_for(ws.receive_bytes(), timeout=RECV_IDLE_TIMEOUT)
                 input_mesh = _decode_mesh(mesh_data)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] mesh receive timed out", request_id)
+                await ws.send_json({"stage": "error", "message": "mesh receive timed out"})
+                await ws.close()
+                return
             except Exception as e:
                 logger.warning("[%s] invalid mesh: %s", request_id, e)
                 await ws.send_json({"stage": "error", "message": f"invalid mesh: {e}"})
