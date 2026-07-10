@@ -132,10 +132,14 @@ async def _run(args) -> None:
                         output_dir = os.path.dirname(os.path.abspath(args.output))
                         os.makedirs(output_dir, exist_ok=True)
                         if args.mode == "rmbg":
-                            # For rmbg mode, ensure the output path ends with .png
+                            # rmbg echoes the input image format: PNG in -> PNG
+                            # out, WebP in -> WebP out. Match the output file
+                            # extension to the format the server reports.
+                            fmt = str(message.get("format", "png")).lower()
+                            ext = "." + fmt
                             output_path = args.output
-                            if not output_path.lower().endswith(".png"):
-                                output_path = os.path.splitext(output_path)[0] + ".png"
+                            if not output_path.lower().endswith(ext):
+                                output_path = os.path.splitext(output_path)[0] + ext
                         else:
                             output_path = args.output
                         with open(output_path, "wb") as f:

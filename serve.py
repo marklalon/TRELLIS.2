@@ -863,14 +863,19 @@ async def _prewarm_flow_models_when_idle() -> None:
             logger.exception("flow-model prewarm failed")
 
 
-def _run_rembg(image: Image.Image) -> bytes:
-    """Run background removal only and return PNG bytes."""
+def _run_rembg(image: Image.Image, output_format: str = "PNG") -> bytes:
+    """Run background removal only and return the cutout encoded in
+    ``output_format`` ("PNG" or "WEBP"). Both formats carry the alpha channel;
+    WebP is saved losslessly so the cutout matte is preserved exactly."""
     rembg_model = state.pipeline.rembg_model
     if rembg_model is None:
         raise RuntimeError("Background removal model is not loaded")
     result = rembg_model(image)
     buf = io.BytesIO()
-    result.save(buf, format="PNG")
+    if output_format == "WEBP":
+        result.save(buf, format="WEBP", lossless=True)
+    else:
+        result.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -955,8 +960,10 @@ async def ws_generate(ws: WebSocket):
       client -> {"type": "cancel"}               (while generation is running)
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
       server -> {"stage": "done", "glb_size": N, ...}  (JSON text frame)
+                (rmbg mode also sets "format": "png"|"webp" on the done frame)
       server -> <raw GLB bytes>                 (binary frame)
-      server -> <raw PNG bytes>                 (binary frame; only when mode="rmbg")
+      server -> <raw image bytes>               (binary frame; only when mode="rmbg";
+                                                 PNG in -> PNG out, otherwise WebP out)
     """
     request_id = uuid.uuid4().hex[:8]
     cancellation = None
@@ -1007,8 +1014,13 @@ async def ws_generate(ws: WebSocket):
                 await ws.close()
                 return
 
-            logger.info("[%s] rmbg request image=%s size=%sx%s mode=%s",
-                        request_id, len(image_data), img.width, img.height, img.mode)
+            # PNG in -> PNG out; every other input format (WebP, JPEG, ...) ->
+            # WebP out. Both carry alpha for the cutout.
+            input_format = (img.format or "PNG").upper()
+            output_format = "PNG" if input_format == "PNG" else "WEBP"
+            logger.info("[%s] rmbg request image=%s size=%sx%s mode=%s in=%s out=%s",
+                        request_id, len(image_data), img.width, img.height, img.mode,
+                        input_format, output_format)
 
             await ws.send_json({
                 "stage": "queued", "queued": False, "request_id": request_id
@@ -1016,18 +1028,19 @@ async def ws_generate(ws: WebSocket):
             await ws.send_json({"stage": "processing", "progress": 0, "request_id": request_id})
 
             t0 = time.time()
-            png_bytes = await asyncio.to_thread(_run_rembg, img)
+            out_bytes = await asyncio.to_thread(_run_rembg, img, output_format)
 
             await ws.send_json({
                 "stage": "done",
                 "elapsed_sec": round(time.time() - t0, 2),
                 "progress": 100,
                 "request_id": request_id,
-                "glb_size": len(png_bytes),
+                "glb_size": len(out_bytes),
+                "format": output_format.lower(),
             })
-            await ws.send_bytes(png_bytes)
-            logger.info("[%s] rmbg request completed bytes=%d elapsed=%.2fs",
-                        request_id, len(png_bytes), time.time() - t0)
+            await ws.send_bytes(out_bytes)
+            logger.info("[%s] rmbg request completed bytes=%d format=%s elapsed=%.2fs",
+                        request_id, len(out_bytes), output_format, time.time() - t0)
             await ws.close()
             return
 
