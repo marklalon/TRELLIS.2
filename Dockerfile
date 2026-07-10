@@ -139,6 +139,20 @@ COPY o-voxel /tmp/extensions/o-voxel
 RUN pip install /tmp/extensions/o-voxel --no-build-isolation --no-cache-dir && \
     rm -rf /tmp/extensions/o-voxel
 
+# ---- SageAttention (pinned commit) ----
+# INT8-QK / FP8-PV fused attention. On sm120 (Blackwell workstation/consumer)
+# `sageattn` dispatches to sageattn_qk_int8_pv_fp8_cuda (per-warp, fp32+fp16
+# accum). Compiled only for sm_120 to keep build time bounded; needs CUDA >=12.8
+# for compute capability 12.0 (satisfied by the cu128 base). Selected at runtime
+# via ATTN_BACKEND=sage. Placed after o-voxel so editing local o-voxel source
+# does not trigger a SageAttention recompile.
+ARG SAGEATTENTION_REF=d1a57a5
+RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/extensions/SageAttention && \
+    git -C /tmp/extensions/SageAttention checkout ${SAGEATTENTION_REF} && \
+    TORCH_CUDA_ARCH_LIST="12.0" EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 4" MAX_JOBS=4 \
+        pip install /tmp/extensions/SageAttention --no-build-isolation --no-cache-dir && \
+    rm -rf /tmp/extensions/SageAttention
+
 # ---- Trim build cruft from the newly added packages ----
 RUN find /usr/local/lib/python3.11/dist-packages -depth -type d -name '__pycache__' -exec rm -rf {} + ; \
     find /usr/local/lib/python3.11/dist-packages -type f -name '*.pyc' -delete ; \

@@ -131,7 +131,7 @@ def scaled_dot_product_attention(*args, **kwargs):
                 out = flash_attn_3.flash_attn_func(q, k, v)
             elif num_all_args == 3:
                 out = flash_attn_3.flash_attn_func(q, k, v)
-    elif config.BACKEND in ['sdpa', 'cudnn_sdpa']:
+    elif config.BACKEND in ['sdpa', 'cudnn_sdpa', 'sage']:
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=2)
         elif num_all_args == 2:
@@ -139,7 +139,12 @@ def scaled_dot_product_attention(*args, **kwargs):
         q = q.permute(0, 2, 1, 3)   # [N, H, L, C]
         k = k.permute(0, 2, 1, 3)   # [N, H, L, C]
         v = v.permute(0, 2, 1, 3)   # [N, H, L, C]
-        out = _torch_sdpa(q, k, v, force_cudnn=config.BACKEND == 'cudnn_sdpa')   # [N, H, L, C]
+        if config.BACKEND == 'sage':
+            if 'sageattn' not in globals():
+                from sageattention import sageattn
+            out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)   # [N, H, L, C]
+        else:
+            out = _torch_sdpa(q, k, v, force_cudnn=config.BACKEND == 'cudnn_sdpa')   # [N, H, L, C]
         out = out.permute(0, 2, 1, 3)   # [N, L, H, C]
     elif config.BACKEND == 'naive':
         if num_all_args == 1:
