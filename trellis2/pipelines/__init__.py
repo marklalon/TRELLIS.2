@@ -2,6 +2,7 @@ import importlib
 
 __attributes = {
     "Trellis2ImageTo3DPipeline": "trellis2_image_to_3d",
+    "ActiveTokenLimitExceeded": "trellis2_image_to_3d",
     "Trellis2TexturingPipeline": "trellis2_texturing",
 }
 

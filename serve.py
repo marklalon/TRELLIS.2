@@ -89,6 +89,21 @@ OVERLAP_POSTPROCESS = os.environ.get("TRELLIS2_OVERLAP_POSTPROCESS", "1") == "1"
 #     set it to 0 if you would rather keep the weights hot in cache.
 TRIM_MEMORY = os.environ.get("TRELLIS2_TRIM_MEMORY", "1") == "1"
 DROP_PAGE_CACHE = os.environ.get("TRELLIS2_DROP_PAGE_CACHE", "1") == "1"
+# VRAM guardrails against a single heavy request OOM-ing the process.
+#   TRELLIS2_MAX_ACTIVE_TOKENS (default off): reject a request whose sparse
+#     structure decodes to more active voxels than this. Peak VRAM scales
+#     ~linearly with the token count and it is known ~0.15s in, so this is a
+#     cheap predictive cap that fails the request cleanly before the expensive
+#     sampling/decode stages. 0 or unset disables it. Tune per GPU: on the log
+#     that motivated this (real torch peak ~24G at ~2.4M-vert output), pick a
+#     ceiling with headroom below the card's usable VRAM.
+#   TRELLIS2_MEM_FRACTION (default 0.0): hard-cap the torch allocator to this
+#     fraction of the device's total VRAM. An over-budget allocation then raises
+#     a catchable CUDA OOM (failing one request) instead of spilling into slow
+#     shared system memory or tripping the OS OOM-killer. Set to 0 to disable.
+_max_active_tokens_raw = int(os.environ.get("TRELLIS2_MAX_ACTIVE_TOKENS", "0"))
+MAX_ACTIVE_TOKENS = _max_active_tokens_raw if _max_active_tokens_raw > 0 else None
+MEM_FRACTION = float(os.environ.get("TRELLIS2_MEM_FRACTION", "0.0"))
 o_voxel = None
 T = TypeVar("T")
 
@@ -351,6 +366,16 @@ def _load_pipeline():
         spec.loader.exec_module(module)
         o_voxel.postprocess = module
 
+    # Hard-cap the torch allocator before any weight lands on the GPU so an
+    # over-budget request raises a catchable CUDA OOM (one failed request)
+    # instead of spilling into slow shared system memory or tripping the OS
+    # OOM-killer. Applies to torch allocations only; must be set per process.
+    if 0 < MEM_FRACTION < 1 and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(MEM_FRACTION, torch.cuda.current_device())
+        free, total = torch.cuda.mem_get_info()
+        logger.info("torch allocator capped at %.0f%% of %.1fG VRAM",
+                    MEM_FRACTION * 100, total / 1e9)
+
     logger.info("Loading pipeline from: %s; background-removal model: %s",
                 MODEL_PATH, REMBG_MODEL_PATH or "pipeline default")
     # The whole pipeline stays resident in VRAM, so load checkpoint weights
@@ -598,6 +623,7 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         seed=params.seed,
         pipeline_type=params.pipeline_type or DEFAULT_PIPELINE,
         max_num_tokens=params.max_num_tokens,
+        max_active_tokens=MAX_ACTIVE_TOKENS,
         preprocess_image=True,
         generate_texture=params.mode != 'mesh',
         sparse_structure_sampler_params={
@@ -1130,7 +1156,13 @@ async def ws_generate(ws: WebSocket):
     except GenerationCancelled as e:
         logger.info("[%s] WebSocket generation cancelled: %s", request_id, e)
     except Exception as e:
-        logger.exception("[%s] WebSocket generation failed", request_id)
+        # A token-limit rejection is an expected, predicted outcome -- log it as a
+        # warning without the alarming full traceback the generic path prints.
+        from trellis2.pipelines import ActiveTokenLimitExceeded
+        if isinstance(e, ActiveTokenLimitExceeded):
+            logger.warning("[%s] rejected: %s", request_id, e)
+        else:
+            logger.exception("[%s] WebSocket generation failed", request_id)
         try:
             await ws.send_json({"stage": "error", "message": str(e)})
             await ws.close()

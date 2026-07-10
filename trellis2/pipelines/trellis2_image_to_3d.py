@@ -13,6 +13,24 @@ from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
 
 
+class ActiveTokenLimitExceeded(RuntimeError):
+    """Raised when the sparse structure decodes to more active voxels (tokens)
+    than the configured ceiling. Peak VRAM scales ~linearly with this count, so
+    it is the earliest reliable predictor of an over-budget request -- known at
+    ~0.15s in, before the expensive shape/texture sampling and decode. The
+    server maps this to a clean client error instead of risking an OOM that
+    would take down concurrent requests.
+    """
+
+    def __init__(self, num_tokens: int, limit: int):
+        self.num_tokens = num_tokens
+        self.limit = limit
+        super().__init__(
+            f"model too complex: {num_tokens} active tokens exceeds limit "
+            f"{limit}; retry with a simpler/less-filled image or 'mesh' mode"
+        )
+
+
 logger = logging.getLogger("trellis2.pipeline")
 # serve.py configures logging only on its own "trellis2.serve" logger and never
 # touches the root logger, so this logger would otherwise inherit root's WARNING
@@ -239,9 +257,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
     def cuda(self) -> None:
         super().cuda()
-        if self._offload:
-            # Start the flow models on the CPU; _resident pages them in on demand.
-            # decoders / image encoder stay resident.
+        if self._offload_mode == "stage":
+            # In "stage" mode, start flow models on CPU; _resident pages them
+            # in and out each stage for minimum VRAM.
             offloaded = []
             for key, model in self.models.items():
                 if self._is_offloadable(key) and isinstance(model, nn.Module):
@@ -712,6 +730,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        max_active_tokens: Optional[int] = None,
         generate_texture: bool = True,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> List[MeshWithVoxel]:
@@ -729,6 +748,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            max_active_tokens (int): Optional ceiling on the number of active
+                voxels decoded from the sparse structure. Peak VRAM scales
+                ~linearly with this count, so exceeding it raises
+                ``ActiveTokenLimitExceeded`` *before* the expensive
+                shape/texture sampling and decode stages -- a service-side guard
+                against a single heavy request OOM-ing the process. ``None``
+                disables the check.
             generate_texture (bool): Whether to sample/decode the texture latent.
                 When False, only the shape is produced (a white, UV-less mesh),
                 skipping the texture flow model and texture decoder entirely.
@@ -778,6 +804,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             num_samples, sparse_structure_sampler_params,
             step_callback=lambda c, t: report(20 + round(c / max(t, 1) * 20), "sampling sparse structure"),
         )
+        # VRAM guard: bail out here, before the two big sampling stages and the
+        # peak-VRAM decode, if the object decoded to more active voxels than the
+        # service budgets for. This is the earliest point the request's peak is
+        # predictable (peak ~ number of active tokens).
+        num_active_tokens = int(coords.shape[0])
+        if max_active_tokens is not None and num_active_tokens > max_active_tokens:
+            logger.warning(
+                "rejecting request: %d active tokens exceeds limit %d",
+                num_active_tokens, max_active_tokens,
+            )
+            raise ActiveTokenLimitExceeded(num_active_tokens, max_active_tokens)
+        logger.info("active tokens=%d (limit=%s)", num_active_tokens,
+                    max_active_tokens if max_active_tokens is not None else "off")
         report(40, "sampling shape")
         # Shape gets a wide 35pp (full) / 55pp (mesh) band for per-step progress.
         # Texture sampling (full only) and decode are compressed into the remainder.
