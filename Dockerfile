@@ -95,7 +95,7 @@ RUN sed -i '/torch\.cross(/{/dim=/!s/)$/, dim=-1)/;}' \
 # Upstream xatlas PackCharts submits one task scheduler task per chart; on
 # meshes with many small charts the submit/notify overhead dominates. The
 # fork chunks charts into ~threadCount*4 tasks with bit-identical output.
-ARG CUMESH_XATLAS_REF=20d983f8e832c38c48526efb850fcd6abe8c2c64
+ARG CUMESH_XATLAS_REF=dca43c690452d3a0ef8362814085e7f26375364b
 RUN set -eux; \
     raw="https://raw.githubusercontent.com/marklalon/CuMesh/${CUMESH_XATLAS_REF}/third_party/xatlas"; \
     mkdir -p /tmp/xatlas && cd /tmp/xatlas; \

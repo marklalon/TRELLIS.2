@@ -1,5 +1,6 @@
 from typing import *
 import os
+import time
 import logging
 from tqdm import tqdm
 import numpy as np
@@ -39,6 +40,18 @@ REMESH_MAX_RES = int(os.environ.get("OVOXEL_REMESH_MAX_RES", "0"))
 
 # Per-stage VRAM tracing for to_glb. Set OVOXEL_VRAM_LOG=0 to disable.
 VRAM_LOG = os.environ.get("OVOXEL_VRAM_LOG", "1") != "0"
+
+# Force the legacy one-AddMesh-per-cluster unwrap path (stock CuMesh.uv_unwrap)
+# even when the fast single-AddMesh path is available. Escape hatch for A/B
+# timing and as a safety fallback if the material-based path ever misbehaves.
+UV_LEGACY = os.environ.get("OVOXEL_UV_LEGACY", "0") != "0"
+
+# UV-unwrap profiling. Set OVOXEL_UV_PROFILE=1 to force CuMesh's per-phase
+# verbose breakdown (Adding clusters / xatlas computeCharts / packCharts /
+# Gathering results) and log the wall-clock cost of the whole uv_unwrap call.
+# The unwrap is a CPU stage (only the initial clustering touches the GPU), so
+# low GPU util is expected; this tells us which CPU phase actually dominates.
+UV_PROFILE = os.environ.get("OVOXEL_UV_PROFILE", "0") != "0"
 
 _vram_prev = None
 
@@ -221,6 +234,119 @@ def _edge_split_by_angle(
     corner_vertex = faces.reshape(-1)
     new_vertices = vertices[corner_vertex[uniq]]
     return new_vertices, new_faces
+
+
+# Whether the compiled xatlas binding (our CuMesh fork) accepts per-face
+# material IDs in add_mesh. Probed once from the pybind signature; when present
+# we can unwrap the whole clustered mesh in a single AddMesh call instead of one
+# per cluster (see _uv_unwrap_fast). Falls back to stock uv_unwrap otherwise.
+_XATLAS_MATERIALS_SUPPORTED: Optional[bool] = None
+
+
+def _xatlas_supports_materials() -> bool:
+    global _XATLAS_MATERIALS_SUPPORTED
+    if _XATLAS_MATERIALS_SUPPORTED is None:
+        try:
+            doc = cumesh.xatlas.Atlas().atlas.add_mesh.__doc__ or ""
+            _XATLAS_MATERIALS_SUPPORTED = "materials" in doc
+        except Exception:
+            _XATLAS_MATERIALS_SUPPORTED = False
+        logger.info("[uv] xatlas per-face materials supported: %s",
+                    _XATLAS_MATERIALS_SUPPORTED)
+    return _XATLAS_MATERIALS_SUPPORTED
+
+
+def _uv_unwrap_fast(mesh, compute_charts_kwargs: dict, verbose: bool):
+    """UV-unwrap a CuMesh by feeding xatlas ~ncpu chunked meshes with materials.
+
+    The stock ``CuMesh.uv_unwrap`` adds every cluster to xatlas as its own mesh
+    (one AddMesh + one scheduler task each). On meshes with tens of thousands of
+    tiny clusters that per-cluster overhead dominates (~0.5 ms each -> ~11 s for
+    23k clusters). Instead we exploit xatlas materials: it never merges faces of
+    different materials into one chart, so tagging each face with its cluster id
+    reproduces the exact same per-cluster charts while letting many clusters
+    share a single AddMesh.
+
+    We don't add the *whole* mesh as one xatlas mesh, though: xatlas does its
+    per-mesh setup (colocal welding, face-group flood-fill) single-threaded, so
+    one giant mesh just moves the bottleneck there. Splitting the clusters across
+    ``~4*ncpu`` chunks (a cluster never spans chunks) restores xatlas's
+    mesh-level parallelism for that setup while keeping the AddMesh/get_mesh
+    loops tiny. Chart output is identical to adding every cluster separately;
+    only packing order differs.
+
+    Returns ``(vertices, faces, uvs, vmaps)`` as CPU tensors, matching
+    uv_unwrap's contract. ``vmaps`` indexes into the mesh's post-clustering
+    vertex array (the ordering shared by ``read()`` / ``read_vertex_normals()``).
+    """
+    from cumesh.xatlas import Atlas
+
+    mesh.remove_degenerate_faces()
+    mesh.compute_charts(**compute_charts_kwargs)
+    new_vertices, new_faces = mesh.read()               # GPU [V,3], [F,3]
+    num_charts, charts_id = mesh.read_atlas_charts()[:2]  # charts_id: [F] int32
+    if verbose:
+        print(f"Get {num_charts} clusters after fast clustering")
+
+    verts = new_vertices.float()
+    faces = new_faces.long()
+    cid = charts_id.long()
+
+    # Assign whole clusters to chunks by (cluster_id % K); grouping faces by
+    # chunk keeps every cluster intact within one chunk.
+    ncpu = os.cpu_count() or 8
+    K = int(max(1, min(int(num_charts), 4 * ncpu)))
+    chunk_of_face = cid % K                              # [F]
+    order = torch.argsort(chunk_of_face)
+    faces_s = faces.index_select(0, order)
+    cid_s = cid.index_select(0, order).int()
+    counts = torch.bincount(chunk_of_face, minlength=K)
+    offs = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).cpu().tolist()
+    verts_cpu = verts.cpu().contiguous()
+
+    _t = time.perf_counter
+    atlas = Atlas()
+    chunk_uverts: List[Optional[torch.Tensor]] = []
+    _t0 = _t()
+    for k in range(K):
+        a, b = offs[k], offs[k + 1]
+        if b <= a:
+            chunk_uverts.append(None)
+            continue
+        fk = faces_s[a:b]                                # [Fk,3] global vids
+        uverts, inv = torch.unique(fk.reshape(-1), return_inverse=True)
+        local_faces = inv.reshape(-1, 3).int().cpu().contiguous()
+        vk = verts.index_select(0, uverts).cpu().contiguous()
+        mk = cid_s[a:b].cpu().contiguous()
+        chunk_uverts.append(uverts.cpu())
+        atlas.atlas.add_mesh(vk, local_faces, None, None, mk)
+    _t1 = _t()
+    atlas.compute_charts(verbose=verbose)
+    _t2 = _t()
+    atlas.pack_charts(verbose=verbose)
+    _t3 = _t()
+
+    vmaps_all, faces_all, uvs_all = [], [], []
+    voff, mi = 0, 0
+    for k in range(K):
+        uv_global = chunk_uverts[k]
+        if uv_global is None:
+            continue
+        vmap_k, faces_k, uv_k = atlas.get_mesh(mi)      # local to chunk k
+        mi += 1
+        vmaps_all.append(uv_global.index_select(0, vmap_k.long()))
+        faces_all.append(faces_k + voff)
+        uvs_all.append(uv_k)
+        voff += vmap_k.shape[0]
+    out_vmaps = torch.cat(vmaps_all)                    # global vids into new_vertices
+    out_faces = torch.cat(faces_all)
+    out_uvs = torch.cat(uvs_all)
+    out_vertices = verts_cpu.index_select(0, out_vmaps)
+    if UV_PROFILE:
+        logger.info("[uv]   chunks=%d add=%.2fs compute_charts=%.2fs "
+                    "pack_charts=%.2fs gather=%.2fs", K, _t1 - _t0, _t2 - _t1,
+                    _t3 - _t2, _t() - _t3)
+    return out_vertices, out_faces, out_uvs, out_vmaps
 
 
 def to_glb(
@@ -521,16 +647,26 @@ def to_glb(
         print("Parameterizing new mesh...")
     
     report(55, "unwrapping UVs")
-    out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
-        compute_charts_kwargs={
-            "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
-            "refine_iterations": mesh_cluster_refine_iterations,
-            "global_iterations": mesh_cluster_global_iterations,
-            "smooth_strength": mesh_cluster_smooth_strength,
-        },
-        return_vmaps=True,
-        verbose=verbose,
-    )
+    _uv_t0 = time.perf_counter()
+    _cc_kwargs = {
+        "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
+        "refine_iterations": mesh_cluster_refine_iterations,
+        "global_iterations": mesh_cluster_global_iterations,
+        "smooth_strength": mesh_cluster_smooth_strength,
+    }
+    if _xatlas_supports_materials() and not UV_LEGACY:
+        # Single-AddMesh fast path: ~11 s -> <1 s on high-cluster-count meshes.
+        out_vertices, out_faces, out_uvs, out_vmaps = _uv_unwrap_fast(
+            mesh, _cc_kwargs, verbose=verbose or UV_PROFILE)
+    else:
+        out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
+            compute_charts_kwargs=_cc_kwargs,
+            return_vmaps=True,
+            verbose=verbose or UV_PROFILE,
+        )
+    if UV_PROFILE:
+        logger.info("[uv] uv_unwrap total=%.2fs  out_verts=%d out_faces=%d",
+                    time.perf_counter() - _uv_t0, out_vertices.shape[0], out_faces.shape[0])
     out_vertices = out_vertices.cuda()
     out_faces = out_faces.cuda()
     out_uvs = out_uvs.cuda()
