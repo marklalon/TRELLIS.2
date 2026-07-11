@@ -1,6 +1,7 @@
 from typing import *
 import os
 import logging
+import threading
 from contextlib import contextmanager
 import torch
 import torch.nn as nn
@@ -157,6 +158,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         # Flow-model keys the last request evicted before decode; "decode" mode
         # prewarms exactly these back onto the GPU after the request finishes.
         self._pending_prewarm: List[str] = []
+        # Parallel-eviction state ("decode" mode): flow models are paged to CPU
+        # the moment they go idle, on a background thread + dedicated stream, so
+        # the D2H copy overlaps the next sampling stage instead of stalling right
+        # before decode. ``_evicted_early`` collects the keys that thread moved;
+        # ``_evict_flow_models`` joins the thread and folds them into the prewarm
+        # set before the single pre-decode empty_cache.
+        self._evict_thread: Optional[threading.Thread] = None
+        self._evict_stream: Optional["torch.cuda.Stream"] = None
+        self._evict_lock = threading.Lock()
+        self._evicted_early: List[str] = []
         if models is None:
             return
         super().__init__(models)
@@ -293,27 +304,103 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 model.cpu()
                 torch.cuda.empty_cache()
 
+    def _join_eviction(self) -> None:
+        """Block until any in-flight parallel eviction (``_evict_flow_models_early``)
+        has finished. Called before decode and before prewarm so that every
+        flow-model device movement stays mutually exclusive, per the offload
+        contract. A no-op when no eviction thread is running."""
+        t = self._evict_thread
+        if t is not None:
+            t.join()
+            self._evict_thread = None
+
+    def _evict_flow_models_early(self, keys: List[str]) -> None:
+        """Page the given *now-idle* flow models to CPU on a background thread and
+        a dedicated CUDA stream, so the (synchronous, pageable) D2H copy runs on
+        the GPU copy engine concurrently with the next sampling stage instead of
+        stalling for seconds right before decode.
+
+        Correctness rests on two invariants:
+          * the eviction stream waits on an event recorded on the current stream,
+            so the copy never frees weights out from under the sampling kernels
+            that just read them;
+          * the caller only ever samples *other* models until
+            ``_evict_flow_models`` joins this thread before decode, so no model is
+            moved while it is in use.
+
+        The single ``empty_cache`` is deferred to the pre-decode join so VRAM is
+        reclaimed in one place. Only meaningful in "decode" mode; a no-op
+        otherwise (in "stage" mode ``_resident`` already evicts each stage)."""
+        if not self._offload or self._offload_mode != "decode":
+            return
+        keys = [k for k in keys
+                if self._is_offloadable(k)
+                and isinstance(self.models.get(k), nn.Module)]
+        if not keys:
+            return
+        # One eviction batch in flight at a time: finish the previous one first
+        # (this also guarantees its moves are visible before we fence this batch).
+        self._join_eviction()
+        if self._evict_stream is None:
+            self._evict_stream = torch.cuda.Stream()
+        stream = self._evict_stream
+        # Fence the copy behind all prior work on the current stream (the
+        # sampling that just read these weights) so we never free them early.
+        fence = torch.cuda.Event()
+        fence.record()
+
+        def _work() -> None:
+            moved: List[str] = []
+            stream.wait_event(fence)
+            with torch.cuda.stream(stream):
+                for key in keys:
+                    model = self.models.get(key)
+                    try:
+                        if next(model.parameters()).device.type != 'cpu':
+                            model.cpu()
+                            moved.append(key)
+                    except StopIteration:
+                        pass
+            stream.synchronize()
+            if moved:
+                with self._evict_lock:
+                    self._evicted_early.extend(moved)
+
+        self._evict_thread = threading.Thread(
+            target=_work, name="flow-evict", daemon=True)
+        self._evict_thread.start()
+
     def _evict_flow_models(self) -> None:
         """Page any resident flow model back to the CPU. Used before decode in
         "decode" mode; a no-op in "stage" mode (already evicted) and when off.
 
-        Records the moved keys (the set this request used) in
-        ``self._pending_prewarm`` so ``prewarm_flow_models`` can page exactly
-        those back onto the GPU once the request has finished.
+        Joins any parallel eviction started mid-request by
+        ``_evict_flow_models_early`` (whose moves land in ``_evicted_early``),
+        then evicts whatever is still resident (typically just the texture flow
+        model, hot until the end of texture sampling). Records the full moved set
+        in ``self._pending_prewarm`` so ``prewarm_flow_models`` can page exactly
+        those back onto the GPU once the request has finished, and issues the
+        single ``empty_cache`` here -- the one sync point before decode.
         """
         if not self._offload:
             return
+        self._join_eviction()
+        early = self._evicted_early
+        self._evicted_early = []
         moved = []
         for key, model in self.models.items():
             if (self._is_offloadable(key) and isinstance(model, nn.Module)
                     and next(model.parameters()).device.type != 'cpu'):
                 model.cpu()
                 moved.append(key)
-        if moved:
-            self._pending_prewarm = moved
+        all_moved = early + moved
+        if all_moved:
+            self._pending_prewarm = all_moved
             torch.cuda.empty_cache()
-            logger.info("evicted idle models to CPU before decode (%s)",
-                        ", ".join(moved))
+            logger.info(
+                "evicted idle models to CPU before decode "
+                "(parallel=[%s] sync=[%s])",
+                ", ".join(early), ", ".join(moved))
 
     def prewarm_flow_models(self) -> None:
         """Page the flow models used by the last request back onto the GPU so the
@@ -329,6 +416,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         if not self._offload or self._offload_mode != "decode":
             return
+        # Any mid-request parallel eviction must be done before we page back.
+        self._join_eviction()
         moved = []
         for key in self._pending_prewarm:
             model = self.models.get(key)
@@ -771,6 +860,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 progress_callback(percent, stage)
 
         report(0, "starting pipeline")
+        # Clean parallel-eviction state from any prior (e.g. rejected) request so
+        # a stale in-flight thread or leftover key set can't leak into this run.
+        self._join_eviction()
+        self._evicted_early = []
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
@@ -823,10 +916,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ActiveTokenLimitExceeded(num_active_tokens, max_active_tokens)
         logger.info("active tokens=%d (limit=%s)", num_active_tokens,
                     max_active_tokens if max_active_tokens is not None else "off")
+        # Sparse-structure models are idle for the rest of the request: page them
+        # to CPU now, in parallel, so the copy overlaps shape sampling instead of
+        # the pre-decode stall. Placed after the token guard so a rejected request
+        # never spawns the thread.
+        self._evict_flow_models_early(
+            ['sparse_structure_flow_model', 'sparse_structure_decoder'])
         report(20, "sampling shape")
-        # Shape gets a wide 55pp (full) / 75pp (mesh) band for per-step progress.
+        # Shape gets a wide 55pp (full) / 70pp (mesh) band for per-step progress.
         # Texture sampling (full only) and decode are compressed into the remainder.
-        shape_end = 75 if generate_texture else 95
+        # Both paths converge at 90 so eviction/decode start uniformly (see below).
+        shape_end = 75 if generate_texture else 90
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
@@ -864,15 +964,28 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         # mesh-only (white model) generation.
         tex_slat = None
         if generate_texture:
+            # Shape flow models are done; page them to CPU in parallel so the copy
+            # overlaps texture sampling. Only the texture flow model stays hot, so
+            # the pre-decode _evict_flow_models has just it (plus empty_cache) left
+            # to do synchronously. (Mesh-only skips this: no texture stage to
+            # overlap with, so those models evict in the pre-decode step instead.)
+            self._evict_flow_models_early(
+                [k for k in self.models
+                 if self._is_offloadable(k) and k != 'tex_slat_flow_model_1024'])
             report(75, "sampling texture")
             tex_slat = self.sample_tex_slat(
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params,
                 step_callback=lambda c, t: report(75 + round(c / max(t, 1) * 15), "sampling texture"),
             )
+        # Eviction/decode start at 90 for both paths (sampling ends at 90 either
+        # way: 75+15 texture, or the mesh-only shape band capped at 90), so the
+        # client never sees progress go backward into this stage. With parallel
+        # eviction most of the work is already done, so this stage is brief; it
+        # holds at 90 until decode's own callback advances it toward 98.
+        decode_start = 90
+        report(decode_start, "evicting flow models")
         self._evict_flow_models()
-        torch.cuda.empty_cache()
-        decode_start = 90 if generate_texture else 95
         report(decode_start, "decoding mesh" + (" and texture" if generate_texture else ""))
         out_mesh = self.decode_latent(
             shape_slat, tex_slat, res,
