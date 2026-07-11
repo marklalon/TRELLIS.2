@@ -91,6 +91,7 @@ async def _run(args) -> None:
         "shape_sampling_steps": args.shape_sampling_steps,
         "alpha_mode": args.alpha_mode,
         "smooth_by_angle": args.smooth_by_angle,
+        "filename": os.path.basename(args.image),
     }
     payload["pipeline_type"] = args.pipeline_type
     payload["tex_shape_slat"] = args.tex_shape_slat

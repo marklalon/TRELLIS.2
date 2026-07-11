@@ -330,6 +330,7 @@ class GenParams(BaseModel):
     tex_shape_slat: int = 512                    # mesh encoding grid resolution in texture mode
     alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
     smooth_by_angle: Optional[float] = None       # None=off, float=angle threshold for edge splitting
+    filename: Optional[str] = None                # original image filename (for logging)
     # Generation mode:
     #   full    - image -> textured GLB (shape + texture; default).
     #   mesh    - image -> white GLB (shape only, no UVs, no texture).
@@ -1087,9 +1088,9 @@ async def ws_generate(ws: WebSocket):
                         request_id, len(mesh_data),
                         len(input_mesh.vertices), len(input_mesh.faces))
 
-        logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s params=%s",
+        logger.info("[%s] image decoded bytes=%d size=%sx%s mode=%s filename=%s params=%s",
                     request_id, len(image_data), img.width, img.height, img.mode,
-                    params.model_dump())
+                    params.filename or "(unknown)", params.model_dump())
 
         loop = asyncio.get_running_loop()
         cancellation = _CancellationToken()
