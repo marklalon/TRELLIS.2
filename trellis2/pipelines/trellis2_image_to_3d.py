@@ -795,20 +795,20 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
         if preprocess_image:
-            report(5, "preprocessing image")
+            report(0, "preprocessing image")
             image = self.preprocess_image(image)
-        report(10, "encoding image conditions")
+        report(5, "encoding image conditions")
         torch.manual_seed(seed)
         cond_512 = self.get_cond([image], 512)
         # cond_1024 is needed by every pipeline type: the non-512 types use it for
         # shape/texture, and the 512 type now uses it for the 1024 texture model.
         cond_1024 = self.get_cond([image], 1024)
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
-        report(20, "sampling sparse structure")
+        report(5, "sampling sparse structure")
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
             num_samples, sparse_structure_sampler_params,
-            step_callback=lambda c, t: report(20 + round(c / max(t, 1) * 20), "sampling sparse structure"),
+            step_callback=lambda c, t: report(5 + round(c / max(t, 1) * 15), "sampling sparse structure"),
         )
         # VRAM guard: bail out here, before the two big sampling stages and the
         # peak-VRAM decode, if the object decoded to more active voxels than the
@@ -823,22 +823,22 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ActiveTokenLimitExceeded(num_active_tokens, max_active_tokens)
         logger.info("active tokens=%d (limit=%s)", num_active_tokens,
                     max_active_tokens if max_active_tokens is not None else "off")
-        report(40, "sampling shape")
-        # Shape gets a wide 35pp (full) / 55pp (mesh) band for per-step progress.
+        report(20, "sampling shape")
+        # Shape gets a wide 55pp (full) / 75pp (mesh) band for per-step progress.
         # Texture sampling (full only) and decode are compressed into the remainder.
         shape_end = 75 if generate_texture else 95
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
                 coords, shape_slat_sampler_params,
-                step_callback=lambda c, t: report(40 + round(c / max(t, 1) * (shape_end - 40)), "sampling shape"),
+                step_callback=lambda c, t: report(20 + round(c / max(t, 1) * (shape_end - 20)), "sampling shape"),
             )
             res = 512
         elif pipeline_type == '1024':
             shape_slat = self.sample_shape_slat(
                 cond_1024, self.models['shape_slat_flow_model_1024'],
                 coords, shape_slat_sampler_params,
-                step_callback=lambda c, t: report(40 + round(c / max(t, 1) * (shape_end - 40)), "sampling shape"),
+                step_callback=lambda c, t: report(20 + round(c / max(t, 1) * (shape_end - 20)), "sampling shape"),
             )
             res = 1024
         elif pipeline_type == '1024_cascade':
@@ -848,7 +848,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 1024,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
-                step_callback=lambda c, t: report(40 + round(c / max(t, 1) * (shape_end - 40)), "sampling shape"),
+                step_callback=lambda c, t: report(20 + round(c / max(t, 1) * (shape_end - 20)), "sampling shape"),
             )
         elif pipeline_type == '1536_cascade':
             shape_slat, res = self.sample_shape_slat_cascade(
@@ -857,7 +857,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 1536,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
-                step_callback=lambda c, t: report(40 + round(c / max(t, 1) * (shape_end - 40)), "sampling shape"),
+                step_callback=lambda c, t: report(20 + round(c / max(t, 1) * (shape_end - 20)), "sampling shape"),
             )
         # Texture always uses the 1024 model with 1024 conditioning (its training
         # distribution), even when the shape stays at 512. Skipped entirely for

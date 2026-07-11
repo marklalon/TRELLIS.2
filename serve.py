@@ -577,10 +577,10 @@ def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
 
     def pipeline_progress(percent: int, stage: str) -> None:
         # The texturing pipeline's 0..100 internal progress spans the sampling
-        # phase's 15%..72% of the whole request (post-processing/export is the
+        # phase's 15%..85% of the whole request (post-processing/export is the
         # remaining tail). Mapping it here lets the client stream progress through
         # shape encoding, per-step texture sampling and decode instead of stalling.
-        reporter.report(15 + round(percent * 0.57), stage)
+        reporter.report(15 + round(percent * 0.7), stage)
 
     out = tex_pipeline.run(
         input_mesh,
@@ -614,9 +614,9 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         return _run_texture_sampling(reporter, image, input_mesh, params)
 
     def pipeline_progress(percent: int, stage: str) -> None:
-        # The model pipeline is about 70% of the complete request; the rest is
+        # The model pipeline is about 80% of the complete request; the rest is
         # mesh cleanup, GLB construction and file export.
-        reporter.report(5 + round(percent * 0.65), stage)
+        reporter.report(5 + round(percent * 0.8), stage)
 
     mesh = pipeline.run(
         image,
@@ -639,7 +639,7 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         },
         progress_callback=pipeline_progress,
     )[0]
-    reporter.report(72, "simplifying mesh")
+    reporter.report(85, "simplifying mesh")
     mesh.simplify(params.simplify)
     return mesh
 
@@ -674,11 +674,11 @@ def _run_postprocess(reporter: "_ProgressReporter", mesh, params: GenParams) -> 
         return data
 
     geometry_only = params.mode == 'mesh'
-    reporter.report(78, "building white mesh" if geometry_only
+    reporter.report(86, "building white mesh" if geometry_only
                     else "building GLB textures and materials")
 
     def postprocess_progress(percent: int, stage: str) -> None:
-        reporter.report(78 + round(percent * 0.17), stage)
+        reporter.report(86 + round(percent * 0.09), stage)
 
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
