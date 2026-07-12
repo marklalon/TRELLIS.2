@@ -199,6 +199,15 @@ class _State:
     # post-processing.
     sampling_lock: asyncio.Lock = asyncio.Lock()
     postprocess_lock: asyncio.Lock = asyncio.Lock()
+    # Monotonic ticket counters for the sampling queue, used to report a live
+    # queue position ("queue_ahead") to waiting clients. ``sampling_enqueued``
+    # dispenses a ticket to each request as it enters the sampling-lock wait;
+    # ``sampling_released`` counts requests that have left that wait (finished
+    # sampling, or abandoned the queue via cancel/disconnect). A waiter's
+    # queue_ahead is therefore ``my_ticket - sampling_released``. Both are only
+    # ever mutated from the single event-loop thread, so no locking is needed.
+    sampling_enqueued: int = 0
+    sampling_released: int = 0
     ready: bool = False
     loaded_at: float = 0.0
     busy: bool = False
@@ -864,56 +873,108 @@ class _VramPeakMonitor:
 async def _generate(image: Image.Image, params: GenParams, request_id: str,
                     progress_callback=None,
                     cancellation: Optional[_CancellationToken] = None,
-                    input_mesh=None) -> bytes:
+                    input_mesh=None, queue_callback=None) -> bytes:
     """Two-phase image -> GLB.
 
     Phase 1 (sampling) holds the sampling lock and saturates the GPU. Phase 2
     (post-processing) holds only the post-processing lock, so once phase 1
     releases the sampling lock the next queued request can start sampling while
     this request finishes its GPU-light GLB construction and export.
+
+    ``queue_callback`` (optional, async) is invoked once per second with
+    ``(waited_sec, queue_ahead)`` while this request is waiting for the sampling
+    lock, so a queued client gets a live heartbeat instead of a silent stall. It
+    runs on the event loop, so it must be a coroutine function (unlike the
+    thread-driven ``progress_callback``).
     """
     cancellation = cancellation or _CancellationToken()
     reporter = _ProgressReporter(request_id, cancellation, progress_callback)
 
+    # Take a queue ticket up front; queue_ahead is measured against how many
+    # earlier tickets have since left the sampling queue.
+    my_ticket = state.sampling_enqueued
+    state.sampling_enqueued += 1
+    released_counted = False
+
+    def _mark_sampling_released() -> None:
+        # Idempotent: advance the "left the queue" counter exactly once for this
+        # request, at whichever point it actually stops occupying/awaiting the
+        # sampling lock (normal completion, cancellation, or error).
+        nonlocal released_counted
+        if not released_counted:
+            released_counted = True
+            state.sampling_released += 1
+
+    wait_started = time.monotonic()
+
+    async def _queue_heartbeat() -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            ahead = max(0, my_ticket - state.sampling_released)
+            waited = round(time.monotonic() - wait_started, 2)
+            await queue_callback(waited, ahead)
+
     with _VramPeakMonitor(request_id):
-        wait_started = time.monotonic()
-        async with _acquire_or_cancel(state.sampling_lock, cancellation,
-                                       lock_name=f"[{request_id}] sampling_lock"):
-            state.busy = True
-            try:
-                mesh = await _to_thread_cancellable(
-                    _run_sampling, reporter, image, params, input_mesh,
-                    cancellation=cancellation,
-                )
-            finally:
-                state.busy = False
-            if not OVERLAP_POSTPROCESS:
-                # Serial fallback: keep the sampling lock held through the whole
-                # post-processing tail so only one request uses the GPU at a time.
-                async with _acquire_or_cancel(state.postprocess_lock, cancellation,
-                                               lock_name=f"[{request_id}] postprocess_lock"):
-                    data = await _to_thread_cancellable(
-                        _run_postprocess, reporter, mesh, params,
+        heartbeat_task = None
+        if queue_callback is not None:
+            heartbeat_task = asyncio.create_task(_queue_heartbeat())
+        try:
+            async with _acquire_or_cancel(state.sampling_lock, cancellation,
+                                           lock_name=f"[{request_id}] sampling_lock"):
+                # Lock acquired -> no longer queued; stop the heartbeat.
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat_task
+                    heartbeat_task = None
+                state.busy = True
+                try:
+                    mesh = await _to_thread_cancellable(
+                        _run_sampling, reporter, image, params, input_mesh,
                         cancellation=cancellation,
                     )
-                    del mesh
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    _schedule_flow_prewarm()
-                    return data
+                finally:
+                    state.busy = False
+                if not OVERLAP_POSTPROCESS:
+                    # Serial fallback: keep the sampling lock held through the whole
+                    # post-processing tail so only one request uses the GPU at a time.
+                    async with _acquire_or_cancel(state.postprocess_lock, cancellation,
+                                                   lock_name=f"[{request_id}] postprocess_lock"):
+                        data = await _to_thread_cancellable(
+                            _run_postprocess, reporter, mesh, params,
+                            cancellation=cancellation,
+                        )
+                        del mesh
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        # Sampling lock releases as this block exits; the next
+                        # request can then run, so free its queue slot now.
+                        _mark_sampling_released()
+                        _schedule_flow_prewarm()
+                        return data
 
-        # Overlap path: the sampling lock is released here; the next request can
-        # sample while this one finishes post-processing under its own lock.
-        async with _acquire_or_cancel(state.postprocess_lock, cancellation,
-                                       lock_name=f"[{request_id}] postprocess_lock"):
-            data = await _to_thread_cancellable(
-                _run_postprocess, reporter, mesh, params, cancellation=cancellation
-            )
-            del mesh
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            _schedule_flow_prewarm()
-            return data
+            # Overlap path: the sampling lock is released here; the next request can
+            # sample while this one finishes post-processing under its own lock.
+            _mark_sampling_released()
+            async with _acquire_or_cancel(state.postprocess_lock, cancellation,
+                                           lock_name=f"[{request_id}] postprocess_lock"):
+                data = await _to_thread_cancellable(
+                    _run_postprocess, reporter, mesh, params, cancellation=cancellation
+                )
+                del mesh
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                _schedule_flow_prewarm()
+                return data
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            # Covers the paths that don't reach a normal release site: a queued
+            # request that cancels/disconnects before acquiring, or an error
+            # mid-sampling. No-op once already counted.
+            _mark_sampling_released()
 
 
 # Strong refs to fire-and-forget prewarm tasks so the loop can't GC them mid-run.
@@ -1209,6 +1270,18 @@ async def ws_generate(ws: WebSocket):
                 future.cancel()
                 cancellation.cancel("WebSocket client disconnected")
 
+        async def send_queue(waited_sec, queue_ahead):
+            # Runs on the event loop (from _generate's heartbeat task), so send
+            # directly rather than round-tripping through run_coroutine_threadsafe.
+            try:
+                await ws.send_json({
+                    "stage": "queued", "queued": True,
+                    "waited_sec": waited_sec, "queue_ahead": queue_ahead,
+                    "request_id": request_id,
+                })
+            except Exception:
+                cancellation.cancel("WebSocket client disconnected")
+
         queued = state.sampling_lock.locked()
         await ws.send_json({
             "stage": "queued", "queued": queued, "request_id": request_id
@@ -1222,6 +1295,7 @@ async def ws_generate(ws: WebSocket):
             _generate(
                 img, params, request_id, send_progress,
                 cancellation=cancellation, input_mesh=input_mesh,
+                queue_callback=send_queue,
             )
         )
         receiver_task = asyncio.create_task(
