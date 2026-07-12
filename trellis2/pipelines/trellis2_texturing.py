@@ -100,6 +100,15 @@ class Trellis2TexturingPipeline(Pipeline):
     def preprocess_mesh(self, mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         """
         Preprocess the input mesh.
+
+        The texture pipeline ignores the input UVs entirely and re-unwraps from
+        scratch, so we weld spatially-coincident vertices up front. A mesh that
+        carries UVs is stored with vertices duplicated along every UV/normal
+        seam; left split, the later ``compute_vertex_normals`` averages each
+        copy over only its side of the seam, producing discontinuous normals at
+        the seams. Welding collapses those duplicates back to the shared-vertex
+        topology a decoder-produced "white" mesh has, so normal averaging
+        crosses the seams and the output normals stay continuous.
         """
         vertices = mesh.vertices
         vertices_min = vertices.min(axis=0)
@@ -111,7 +120,35 @@ class Trellis2TexturingPipeline(Pipeline):
         vertices[:, 1] = -vertices[:, 2]
         vertices[:, 2] = tmp
         assert np.all(vertices >= -0.5) and np.all(vertices <= 0.5), 'vertices out of range'
-        return trimesh.Trimesh(vertices=vertices, faces=mesh.faces, process=False)
+        vertices, faces = self._weld_vertices(vertices, mesh.faces)
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    @staticmethod
+    def _weld_vertices(vertices: np.ndarray, faces: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Merge spatially-coincident vertices and remap the faces onto the merged
+        set, so a UV-split input collapses to shared-vertex topology. Vertices
+        are quantized before comparison to fold near-duplicates (exporters emit
+        bit-identical seam duplicates, but this tolerates float drift too).
+        Degenerate faces that collapse under the merge are dropped.
+        """
+        quantized = np.round(vertices / 1e-5).astype(np.int64)
+        _, unique_idx, inverse = np.unique(
+            quantized, axis=0, return_index=True, return_inverse=True
+        )
+        # Some NumPy 2.0.x releases return ``inverse`` with a trailing axis when
+        # ``axis=0`` is used; flatten so face indexing is shape-agnostic.
+        inverse = np.asarray(inverse).reshape(-1)
+        welded_vertices = vertices[unique_idx]
+        welded_faces = inverse[faces.reshape(-1)].reshape(faces.shape)
+        # Drop faces that became degenerate (two corners welded together).
+        non_degenerate = (
+            (welded_faces[:, 0] != welded_faces[:, 1])
+            & (welded_faces[:, 1] != welded_faces[:, 2])
+            & (welded_faces[:, 0] != welded_faces[:, 2])
+        )
+        welded_faces = welded_faces[non_degenerate]
+        return welded_vertices, welded_faces
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -287,50 +324,40 @@ class Trellis2TexturingPipeline(Pipeline):
 
         vertices = mesh.vertices
         faces = mesh.faces
-        normals = mesh.vertex_normals
         vertices_torch = torch.from_numpy(vertices).float().cuda()
         faces_torch = torch.from_numpy(faces).int().cuda()
         report(0, "unwrapping UVs")
-        if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-            uvs = mesh.visual.uv.copy()
-            uvs[:, 1] = 1 - uvs[:, 1]
-            uvs_torch = torch.from_numpy(uvs).float().cuda()
+
+        # Always ignore input UVs and re-unwrap — guarantees a clean vertex
+        # layout and correct normals regardless of the input mesh state.
+        _cumesh = cumesh.CuMesh()
+        _cumesh.init(vertices_torch, faces_torch)
+        _cc_kwargs = {
+            "threshold_cone_half_angle_rad": np.radians(90.0),
+            "refine_iterations": 0,
+            "global_iterations": 1,
+            "smooth_strength": 1,
+        }
+        _uv_verbose = o_voxel.postprocess.UV_PROFILE
+        if o_voxel.postprocess._xatlas_supports_materials() and not o_voxel.postprocess.UV_LEGACY:
+            out_vertices, out_faces, out_uvs, out_vmaps = o_voxel.postprocess._uv_unwrap_fast(
+                _cumesh, _cc_kwargs, verbose=_uv_verbose)
         else:
-            _cumesh = cumesh.CuMesh()
-            _cumesh.init(vertices_torch, faces_torch)
-            # Same fast UV unwrap path as o_voxel.postprocess.to_glb: use xatlas
-            # per-face materials to batch many clusters into a few AddMesh calls,
-            # avoiding the O(n_clusters) overhead of stock uv_unwrap.
-            _cc_kwargs = {
-                "threshold_cone_half_angle_rad": np.radians(90.0),
-                "refine_iterations": 0,
-                "global_iterations": 1,
-                "smooth_strength": 1,
-            }
-            _uv_verbose = o_voxel.postprocess.UV_PROFILE
-            if o_voxel.postprocess._xatlas_supports_materials() and not o_voxel.postprocess.UV_LEGACY:
-                out_vertices, out_faces, out_uvs, out_vmaps = o_voxel.postprocess._uv_unwrap_fast(
-                    _cumesh, _cc_kwargs, verbose=_uv_verbose)
-            else:
-                out_vertices, out_faces, out_uvs, out_vmaps = _cumesh.uv_unwrap(
-                    compute_charts_kwargs=_cc_kwargs, return_vmaps=True, verbose=_uv_verbose)
-            vertices_torch = out_vertices.cuda()
-            faces_torch = out_faces.cuda()
-            uvs_torch = out_uvs.cuda()
-            vmap = out_vmaps.cuda()
-            vertices = vertices_torch.cpu().numpy()
-            faces = faces_torch.cpu().numpy()
-            uvs = uvs_torch.cpu().numpy()
-            # Recompute vertex normals on the unwrapped cumesh topology and remap
-            # them through vmap (same approach as o_voxel.postprocess.to_glb). The
-            # input trimesh's own vertex_normals array does NOT line up with
-            # uv_unwrap's vertex ordering, so indexing it by vmap scrambled the
-            # normals (they ended up uncorrelated with the geometry, breaking PBR
-            # shading in viewers).
-            _cumesh.compute_vertex_normals()
-            cu_normals = _cumesh.read_vertex_normals()
-            normals = cu_normals[vmap.to(cu_normals.device)].cpu().numpy()
-                
+            out_vertices, out_faces, out_uvs, out_vmaps = _cumesh.uv_unwrap(
+                compute_charts_kwargs=_cc_kwargs, return_vmaps=True, verbose=_uv_verbose)
+        vertices_torch = out_vertices.cuda()
+        faces_torch = out_faces.cuda()
+        uvs_torch = out_uvs.cuda()
+        vmap = out_vmaps.cuda()
+        vertices = vertices_torch.cpu().numpy()
+        faces = faces_torch.cpu().numpy()
+        uvs = uvs_torch.cpu().numpy()
+
+        # Compute normals from the unwrapped geometry (same as to_glb).
+        _cumesh.compute_vertex_normals()
+        cu_normals = _cumesh.read_vertex_normals()
+        normals = cu_normals[vmap.to(cu_normals.device)].cpu().numpy()
+
         # rasterize
         report(30, "rasterizing texture")
         ctx = dr.RasterizeCudaContext()
