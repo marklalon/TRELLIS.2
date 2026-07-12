@@ -303,12 +303,22 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         if not self._offload:
             return
-        moved = []
+        candidates = []
         for key, model in self.models.items():
             if (self._is_offloadable(key) and isinstance(model, nn.Module)
                     and next(model.parameters()).device.type != 'cpu'):
-                model.cpu()
-                moved.append(key)
+                candidates.append((key, model))
+        if not candidates:
+            return
+
+        moved = []
+        for key, model in candidates:
+            model.to('cpu', non_blocking=True)
+            moved.append(key)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         if moved:
             self._pending_prewarm = moved
             torch.cuda.empty_cache()
