@@ -36,6 +36,7 @@ python serve.py --host 0.0.0.0 --port 8000
 | `TRELLIS2_MODEL_PATH` | `/models/microsoft/TRELLIS.2-4B` | Weights path / HF repo |
 | `TRELLIS2_PIPELINE` | `512` | Default pipeline type: `512` / `1024` / `1024_cascade` / `1536_cascade` |
 | `TRELLIS2_PORT` | `8000` | Listen port |
+| `TRELLIS2_SYNTHETIC_WARMUP` | `0` | Run one synthetic generation after startup (`docker-compose.yml` enables it); other parameters (mode=full, steps=1, size=512, etc.) are hardcoded in `serve.py` |
 
 ## Endpoints
 

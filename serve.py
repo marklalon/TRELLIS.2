@@ -77,6 +77,16 @@ WS_TOTAL_TIMEOUT = float(os.environ.get("TRELLIS2_WS_TOTAL_TIMEOUT", "120"))
 # sampling. Set to 0 to fall back to fully serial generation (e.g. if VRAM is
 # too tight to keep one finished mesh resident while another request samples).
 OVERLAP_POSTPROCESS = os.environ.get("TRELLIS2_OVERLAP_POSTPROCESS", "1") == "1"
+SYNTHETIC_WARMUP = os.environ.get("TRELLIS2_SYNTHETIC_WARMUP", "0") == "1"
+SYNTHETIC_WARMUP_DELAY_SEC = 0.0
+SYNTHETIC_WARMUP_PIPELINE = DEFAULT_PIPELINE
+SYNTHETIC_WARMUP_MODE = "full"
+SYNTHETIC_WARMUP_SEED = 1
+SYNTHETIC_WARMUP_SHAPE_STEPS = 1
+SYNTHETIC_WARMUP_TEXTURE_STEPS = 1
+SYNTHETIC_WARMUP_TEXTURE_SIZE = 512
+SYNTHETIC_WARMUP_DECIMATION_TARGET = 20000
+SYNTHETIC_WARMUP_SIMPLIFY = 500000
 # After the pipeline is resident in VRAM, reclaim the transient host memory the
 # load leaves behind. Two independent knobs:
 #   TRELLIS2_TRIM_MEMORY (default on): gc + empty_cache + glibc malloc_trim, to
@@ -193,6 +203,7 @@ class _State:
     loaded_at: float = 0.0
     busy: bool = False
     rembg_warmup_status: str = "not_started"
+    synthetic_warmup_status: str = "not_started"
 
 
 state = _State()
@@ -489,6 +500,91 @@ async def _background_rembg_warmup() -> None:
     except Exception:
         state.rembg_warmup_status = "failed"
         logger.exception("Background-removal warmup failed")
+
+
+def _make_synthetic_warmup_image() -> Image.Image:
+    """Create a simple alpha-matted object image for startup warmup."""
+    from PIL import ImageDraw
+
+    image = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((116, 64, 396, 344), fill=(196, 82, 56, 255))
+    draw.polygon(
+        [(256, 352), (132, 452), (380, 452)],
+        fill=(48, 104, 184, 255),
+    )
+    draw.rectangle((210, 252, 302, 420), fill=(236, 190, 72, 255))
+    draw.ellipse((205, 140, 248, 183), fill=(255, 244, 224, 255))
+    draw.ellipse((264, 140, 307, 183), fill=(255, 244, 224, 255))
+    return image
+
+
+async def _background_synthetic_request_warmup() -> None:
+    """Run one synthetic generation after startup to JIT/autotune hot paths."""
+    if not SYNTHETIC_WARMUP:
+        state.synthetic_warmup_status = "skipped"
+        logger.info("Synthetic request warmup disabled")
+        return
+
+    state.synthetic_warmup_status = "running"
+    try:
+        if SYNTHETIC_WARMUP_DELAY_SEC > 0:
+            await asyncio.sleep(SYNTHETIC_WARMUP_DELAY_SEC)
+        if not state.ready or state.pipeline is None:
+            state.synthetic_warmup_status = "skipped"
+            logger.info("Synthetic request warmup skipped: pipeline not ready")
+            return
+
+        params = GenParams(
+            seed=SYNTHETIC_WARMUP_SEED,
+            pipeline_type=SYNTHETIC_WARMUP_PIPELINE,
+            texture_size=SYNTHETIC_WARMUP_TEXTURE_SIZE,
+            decimation_target=SYNTHETIC_WARMUP_DECIMATION_TARGET,
+            simplify=SYNTHETIC_WARMUP_SIMPLIFY,
+            texture_sampling_steps=SYNTHETIC_WARMUP_TEXTURE_STEPS,
+            shape_sampling_steps=SYNTHETIC_WARMUP_SHAPE_STEPS,
+            filename="synthetic-warmup.png",
+            mode=SYNTHETIC_WARMUP_MODE,
+        )
+        if params.mode == "texture":
+            raise ValueError(
+                "TRELLIS2_SYNTHETIC_WARMUP_MODE=texture needs an input mesh; "
+                "use full, mesh, or rmbg"
+            )
+
+        image = _make_synthetic_warmup_image()
+        request_id = f"warmup-{uuid.uuid4().hex[:6]}"
+        started_at = time.monotonic()
+        logger.info(
+            "[%s] synthetic request warmup started mode=%s pipeline=%s "
+            "shape_steps=%d texture_steps=%d texture_size=%d decimation=%d",
+            request_id, params.mode, params.pipeline_type,
+            params.shape_sampling_steps, params.texture_sampling_steps,
+            params.texture_size, params.decimation_target,
+        )
+        if params.mode == "rmbg":
+            data = await asyncio.to_thread(_run_rembg, image, "PNG")
+        else:
+            data = await _generate(image, params, request_id)
+        state.synthetic_warmup_status = "complete"
+        logger.info(
+            "[%s] synthetic request warmup completed bytes=%d elapsed=%.2fs",
+            request_id, len(data), time.monotonic() - started_at,
+        )
+    except asyncio.CancelledError:
+        state.synthetic_warmup_status = "cancelled"
+        logger.info("Synthetic request warmup cancelled")
+        raise
+    except Exception:
+        state.synthetic_warmup_status = "failed"
+        logger.exception("Synthetic request warmup failed")
+
+
+async def _background_startup_warmups() -> None:
+    """Run non-critical startup warmups without blocking server readiness."""
+    await _background_rembg_warmup()
+    await _background_synthetic_request_warmup()
+
 
 class _ProgressReporter:
     """Per-request progress/timing, shared across the sampling and
@@ -930,7 +1026,7 @@ async def _watch_ws_cancellation(
 async def lifespan(app: FastAPI):
     # Load synchronously so /health only reports ready once the model is up.
     await asyncio.to_thread(_load_pipeline)
-    warmup_task = asyncio.create_task(_background_rembg_warmup())
+    warmup_task = asyncio.create_task(_background_startup_warmups())
     try:
         yield
     finally:
@@ -948,7 +1044,12 @@ app = FastAPI(title="TRELLIS.2 Inference Server", version="1.0", lifespan=lifesp
 async def health():
     if not state.ready:
         return JSONResponse({"status": "loading"}, status_code=503)
-    return {"status": "ok", "busy": state.busy}
+    return {
+        "status": "ok",
+        "busy": state.busy,
+        "rembg_warmup": state.rembg_warmup_status,
+        "synthetic_warmup": state.synthetic_warmup_status,
+    }
 
 
 @app.websocket("/ws/generate")
