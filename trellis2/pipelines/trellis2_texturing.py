@@ -298,10 +298,26 @@ class Trellis2TexturingPipeline(Pipeline):
         else:
             _cumesh = cumesh.CuMesh()
             _cumesh.init(vertices_torch, faces_torch)
-            vertices_torch, faces_torch, uvs_torch, vmap = _cumesh.uv_unwrap(return_vmaps=True)
-            vertices_torch = vertices_torch.cuda()
-            faces_torch = faces_torch.cuda()
-            uvs_torch = uvs_torch.cuda()
+            # Same fast UV unwrap path as o_voxel.postprocess.to_glb: use xatlas
+            # per-face materials to batch many clusters into a few AddMesh calls,
+            # avoiding the O(n_clusters) overhead of stock uv_unwrap.
+            _cc_kwargs = {
+                "threshold_cone_half_angle_rad": np.radians(90.0),
+                "refine_iterations": 0,
+                "global_iterations": 1,
+                "smooth_strength": 1,
+            }
+            _uv_verbose = o_voxel.postprocess.UV_PROFILE
+            if o_voxel.postprocess._xatlas_supports_materials() and not o_voxel.postprocess.UV_LEGACY:
+                out_vertices, out_faces, out_uvs, out_vmaps = o_voxel.postprocess._uv_unwrap_fast(
+                    _cumesh, _cc_kwargs, verbose=_uv_verbose)
+            else:
+                out_vertices, out_faces, out_uvs, out_vmaps = _cumesh.uv_unwrap(
+                    compute_charts_kwargs=_cc_kwargs, return_vmaps=True, verbose=_uv_verbose)
+            vertices_torch = out_vertices.cuda()
+            faces_torch = out_faces.cuda()
+            uvs_torch = out_uvs.cuda()
+            vmap = out_vmaps.cuda()
             vertices = vertices_torch.cpu().numpy()
             faces = faces_torch.cpu().numpy()
             uvs = uvs_torch.cpu().numpy()
@@ -423,14 +439,14 @@ class Trellis2TexturingPipeline(Pipeline):
             report(15 + round(percent * 0.10), stage)
 
         def report_sampling_step(completed: int, total: int) -> None:
-            # Texture sampling occupies the 25..55 band of the run.
-            report(25 + round(completed / max(total, 1) * 30), "sampling texture")
+            # Texture sampling occupies the 25..75 band of the run.
+            report(25 + round(completed / max(total, 1) * 50), "sampling texture")
 
         def report_postprocess(percent: int, stage: str) -> None:
             # postprocess_mesh (UV unwrap, rasterize, grid-sample, inpaint) is the
-            # long pole of texture-only, so give it a wide 62..98 band with internal
+            # long pole of texture-only, so give it a wide 82..98 band with internal
             # steps instead of freezing the client on a single "decoding" report.
-            report(62 + round(percent * 0.36), stage)
+            report(82 + round(percent * 0.16), stage)
 
         report(0, "starting texture pipeline")
         if preprocess_image:
@@ -481,13 +497,14 @@ class Trellis2TexturingPipeline(Pipeline):
             # blocks, so decode -- the binding peak -- runs without the flow weights
             # or the sampling scratch resident. Order matters: free the flow DiT
             # first, then bring the decoder back into the reclaimed space.
+            report(75, "evicting flow models")
             if before_decode is not None:
                 before_decode()
             if evict_decoder:
                 torch.cuda.empty_cache()
                 decoder.to(self._device)
                 evict_decoder = False  # restored; skip the finally fallback
-            report(58, "decoding texture")
+            report(78, "decoding texture")
             pbr_voxel = self.decode_tex_slat(tex_slat)
             out_mesh = self.postprocess_mesh(
                 mesh, pbr_voxel, resolution, texture_size,
