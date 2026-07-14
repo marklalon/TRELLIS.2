@@ -613,7 +613,7 @@ def to_glb(
 
     # --- Geometry-only (white mesh) short-circuit ---
     # Skip UV unwrapping and texture baking entirely: return a plain mesh with
-    # vertex normals but no UVs and no material.
+    # vertex normals and an explicit non-metallic material.
     if geometry_only:
         report(70, "reading geometry")
         out_vertices, out_faces = mesh.read()
@@ -634,6 +634,11 @@ def to_glb(
             faces=faces_np,
             vertex_normals=normals_np,
             process=False,
+            visual=trimesh.visual.TextureVisuals(
+                material=trimesh.visual.material.PBRMaterial(
+                    metallicFactor=0.0,
+                )
+            ),
         )
         if use_tqdm:
             pbar.close()
