@@ -363,7 +363,7 @@ def to_glb(
     remesh: bool = False,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
-    mesh_cluster_threshold_cone_half_angle_rad=np.radians(90.0),
+    mesh_cluster_threshold_cone_half_angle_rad=np.radians(60.0),
     mesh_cluster_refine_iterations=0,
     mesh_cluster_global_iterations=1,
     mesh_cluster_smooth_strength=1,

@@ -333,7 +333,7 @@ class Trellis2TexturingPipeline(Pipeline):
         _cumesh = cumesh.CuMesh()
         _cumesh.init(vertices_torch, faces_torch)
         _cc_kwargs = {
-            "threshold_cone_half_angle_rad": np.radians(90.0),
+            "threshold_cone_half_angle_rad": np.radians(60.0),
             "refine_iterations": 0,
             "global_iterations": 1,
             "smooth_strength": 1,

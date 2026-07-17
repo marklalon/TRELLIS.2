@@ -22,6 +22,15 @@ import sys
 import time
 from contextlib import suppress
 
+
+def _tex_shape_slat_type(x: str) -> int:
+    """Argparse type: require 512 <= value <= 1024."""
+    ix = int(x)
+    if not 512 <= ix <= 1024:
+        raise argparse.ArgumentTypeError(f"value must be 512~1024, got {ix}")
+    return ix
+
+
 def _websocket_url(server: str) -> str:
     base = server.rstrip("/")
     if base.startswith("https://"):
@@ -212,10 +221,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--tex-shape-slat",
-        type=int,
+        type=_tex_shape_slat_type,
         default=512,
-        choices=[512, 1024],
-        help="Mesh shape encoding grid resolution in texture mode (512 or 1024; default: 512)",
+        help="Mesh shape encoding grid resolution in texture mode (512~1024; default: 512)",
     )
     parser.add_argument(
         "--simplify",

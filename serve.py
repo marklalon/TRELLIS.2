@@ -47,7 +47,7 @@ import torch
 from PIL import Image
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
             time.monotonic() - _runtime_import_started)
 
@@ -401,7 +401,7 @@ class GenParams(BaseModel):
     max_num_tokens: int = 49152
     texture_sampling_steps: int = 12             # tex SLat sampling steps
     shape_sampling_steps: int = 12               # shape SLat sampling steps
-    tex_shape_slat: int = 512                    # mesh encoding grid resolution in texture mode
+    tex_shape_slat: int = Field(default=512, ge=512, le=1024)  # mesh encoding grid resolution in texture mode (512~1024)
     alpha_mode: Literal['OPAQUE', 'MASK', 'BLEND'] = 'OPAQUE'  # OPAQUE / MASK / BLEND
     smooth_by_angle: Optional[float] = None       # None=off, float=angle threshold for edge splitting
     filename: Optional[str] = None                # original image filename (for logging)
@@ -749,6 +749,10 @@ def _run_texture_sampling(reporter: "_ProgressReporter", image: Image.Image,
         preprocess_image=True,
         tex_slat_sampler_params={
             "steps": params.texture_sampling_steps,
+            "guidance_strength": 4.0,
+            "guidance_rescale": 0.2,
+            "guidance_interval": [0.0, 0.9],
+            "rescale_t": 3.0,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
         resolution=params.tex_shape_slat,
@@ -787,14 +791,27 @@ def _run_sampling(reporter: "_ProgressReporter", image: Image.Image,
         preprocess_image=True,
         generate_texture=params.mode != 'mesh',
         sparse_structure_sampler_params={
+            "steps": params.shape_sampling_steps,
+            "guidance_strength": 6.5,
+            "guidance_rescale": 0.05,
+            "guidance_interval": [0.1, 1.0],
+            "rescale_t": 4.0,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
         shape_slat_sampler_params={
             "steps": params.shape_sampling_steps,
+            "guidance_strength": 6.5,
+            "guidance_rescale": 0.05,
+            "guidance_interval": [0.1, 1.0],
+            "rescale_t": 4.0,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
         tex_slat_sampler_params={
             "steps": params.texture_sampling_steps,
+            "guidance_strength": 4.0,
+            "guidance_rescale": 0.2,
+            "guidance_interval": [0.0, 0.9],
+            "rescale_t": 3.0,
             "cancellation_callback": reporter.raise_if_cancelled,
         },
         progress_callback=pipeline_progress,
