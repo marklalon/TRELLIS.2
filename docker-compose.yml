@@ -76,7 +76,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    # Override `command:` above with `demo`, `app`, `texturing`, or `bash` for other modes.
+    # Override `command:` above with `bash` or `python` for other modes.
 
 volumes:
   hf_cache:

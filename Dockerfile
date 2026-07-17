@@ -47,7 +47,6 @@ RUN pip install --no-cache-dir \
     ninja==1.13.0 \
     trimesh==4.12.2 \
     transformers==5.12.1 \
-    gradio==6.0.1 \
     tensorboard==2.20.0 \
     pandas==2.3.3 \
     lpips==0.1.4 \
@@ -172,8 +171,5 @@ WORKDIR /workspace/TRELLIS.2
 
 # Inference server port (vLLM-style service mode: `serve`)
 EXPOSE 8000
-# Gradio web UI port (`app`)
-EXPOSE 7860
-
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["demo"]

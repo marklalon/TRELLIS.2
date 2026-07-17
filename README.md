@@ -173,18 +173,9 @@ Upon execution, the script generates the following files:
 
 **Note:** The `.glb` file is exported in `OPAQUE` mode by default. Although the alpha channel is preserved within the texture map, it is not active initially. To enable transparency, import the asset into your 3D software and manually connect the texture's alpha channel to the material's opacity or alpha input.
 
-#### Web Demo
-
-[app.py](app.py) provides a simple web demo for image to 3D asset generation. you can run the demo with the following command:
-```sh
-python app.py
-```
-
-Then, you can access the demo at the address shown in the terminal.
-
 ### 2. PBR Texture Generation
 
-Please refer to the [example_texturing.py](example_texturing.py) for an example of how to generate PBR textures for a given 3D shape. Also, you can use the [app_texturing.py](app_texturing.py) to run a web demo for PBR texture generation.
+Please refer to the [example_texturing.py](example_texturing.py) for an example of how to generate PBR textures for a given 3D shape.
 
 
 ## 🏋️ Training
